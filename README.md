@@ -1,14 +1,16 @@
-# northstar_radio
+NORTHSTAR RADIO
 
 Plugin for GTA VC that recreates the whole radio system from scratch, allowing you to add infinite amount of new radio stations, assign new default stations to vehicles and play ambient radio from traffic. Created with AI (Claude).
 
 HOW TO INSTALL
+
 1. IMPORTANT: Download Ultimate ASI Loader (https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases) and install it. The plugin will not work without it.
 2. IMPORTANT: Download bass.dll (https://www.un4seen.com) and bass_fx.dll (https://www.un4seen.com/bass.html#addons), put them in the root folder of your GTA Vice City game. I cannot distribute these files, but plugin will not work without them.
 3. Put NorthstarRadio.asi and NorthstarRadio.ini into your root GTA Vice City folder or your "scripts" folder.
 4. Enjoy.
 
 HOW TO SET UP
+
 1.  You can assign new buttons to change radio station through [CONTROLS] section of INI file. You can find the full list of key ids here: https://asawicki.info/nosense/doc/devices/keyboard/key_codes.html
 2.  You can assign controller buttons as well, according to this list:
 
@@ -35,6 +37,7 @@ HOW TO SET UP
 10. You can turn Ambient Radio on and off through [SETTINGS] section of INI file. Only the cars listed in [VEHICLES] section will have ambient radio. Ambient radio turns off every time the vehicle is encountered, but only if it's required at a certain distance. If a vehicle spawned too close, you will not hear the ambient radio. It is by design.
 
 HOW TO CODE
+
 If you want to edit the code and build it from source, you're going to need the following:
 1. Visual Studio 2019 or later
 2. plugin-sdk for Vice City — https://github.com/DK22Pac/plugin-sdk
@@ -44,6 +47,7 @@ If you want to edit the code and build it from source, you're going to need the 
 Linker flag required: /SAFESEH:NO (due to bass_fx.lib)
 
 HOW IT ALL WORKS
+
 - Turns off original radio.
 - Turns off switching radio button.
 - Every time the game is loaded, picks a number at random and adds 1 to it every millisecond, imitating the timestamp of the radio.
@@ -58,9 +62,11 @@ HOW IT ALL WORKS
 - If vehicles are spawned too close to the player, doesn't play the ambient radio.
 
 HOW TO DISTRIBUTE
+
 It's an open source project done with the help of AI. Please use it for your business and pleasure, but always credit me and never charge any money for it. You can edit the code according to your needs.
 
 HOW TO CONTACT ME
+
 GitHub: https://github.com/captain-northstar
 EMail: northstar.games.studio@gmail.com
 YouTube: https://www.youtube.com/@Northstar_Games_Studio
