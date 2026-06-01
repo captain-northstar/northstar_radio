@@ -15,19 +15,33 @@ HOW TO SET UP
 2.  You can assign controller buttons as well, according to this list:
 
 0  — disabled
+
 1 — DPAD UP
+
 2 — DPAD DOWN
+
 4 — DPAD LEFT
+
 8 — DPAD RIGHT
+
 16 — START
+
 32 — BACK
+
 64 — LEFT THUMB
+
 128 — RIGHT THUMB
+
 256 — LEFT SHOULDER
+
 512 — RIGHT SHOULDER
+
 4096 — A
+
 8192 — B
+
 16384 — X
+
 32768 — Y
 
 3. Mouse Scroll works by default both for changing to the next station and the previous one.
@@ -68,9 +82,15 @@ It's an open source project done with the help of AI. Please use it for your bus
 HOW TO CONTACT ME
 
 GitHub: https://github.com/captain-northstar
+
 EMail: northstar.games.studio@gmail.com
+
 YouTube: https://www.youtube.com/@Northstar_Games_Studio
-Instagram: instagram.com/northstar.games.studio
-TikTok: tiktok.com/@northstar.games
-Discord: discord.gg/HbeMpFxXc6
-Website: northstargames.tilda.ws
+
+Instagram: https://www.instagram.com/northstar.games.studio
+
+TikTok: https://www.tiktok.com/@northstar.games
+
+Discord: https://discord.com/invite/HbeMpFxXc6
+
+Website: https://northstargames.tilda.ws/
