@@ -27,6 +27,7 @@ Version 0.9.1
 - New [SETTINGS] RadioAutoTune option: set to 1 to make the station you're listening to follow you into every vehicle you enter, regardless of distance (off by default).
 - Fixed the original Vice City stations restarting from the top of the broadcast after quitting and loading a save — they now resume at a natural spot, and only open at the top on a genuine new game.
 - New [SETTINGS] ScriptIntegration option: set to 0 to run the core radio without hooking the game's mission script (no story announcements, mission-radio changes, or ducking) — for total-conversion mods with a custom main.scm where that integration would otherwise crash on missions.
+- The default controller button for changing station is now LEFT SHOULDER (L1 / LB) — Vice City's native radio button — instead of D-PAD LEFT.
 
 Version 0.9
 - Initial release.
