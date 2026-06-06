@@ -3,6 +3,7 @@
 #include "cDMAudio.h"
 #include "CRunningScript.h"
 #include "CTheScripts.h"
+#include "CGame.h"
 #include "safetyhook.hpp"
 #include <fstream>
 #include <string>
@@ -204,28 +205,42 @@ static bool __fastcall Hook_ChangeStationJustDown(CPad* self, void* edx)
     return false;
 }
 
-// Make SetRadioInCar a complete no-op so the native audio system never registers
-// a station change via the official setter.
-static void __fastcall Hook_SetRadioInCar(cDMAudio* self, void* edx, unsigned int radio)
+// Inline (trampoline) hooks for the native radio setter cDMAudio::SetRadioInCar
+// (0x5F9730) and the radio audio-process function (0x5FB600). Unlike a plain
+// no-op JMP, the trampoline lets us call the ORIGINAL when the player is on foot
+// inside an interior — so interiors that play ambient music/radio (clubs, shops,
+// etc.) work normally instead of being silenced. Everywhere else we suppress so
+// our BASS radio stays in charge.
+static SafetyHookInline gSetRadioInCarHook;
+static SafetyHookInline gRadioProcessHook;
+
+extern bool gPlayerInVehicle; // defined in Main.cpp; updated every frame
+
+// Let the game's native radio / ambient audio run only when the player is on foot
+// inside an interior (CGame::currArea != 0). In the open world, or while in a
+// vehicle, we suppress (the BASS radio handles everything). Gating on "on foot"
+// too means a vehicle driven into an interior still uses our radio (no doubling).
+static bool LetNativeAudioRun()
 {
-    // Intentionally empty.
+    return CGame::currArea != 0 && !gPlayerInVehicle;
 }
 
-// No-op the vehicle radio audio entity update function (0x5FB600).
-//
-// This is the root source of all three remaining problems:
-//   1. It reads CPad::NewMouseControllerState.wheelUp/Down directly (bypassing our
-//      ChangeStationJustDown hook, which only covers the keyboard/controller path).
-//   2. It writes the HUD radio-name display timer BEFORE calling SetRadioInCar,
-//      so our SetRadioInCar no-op never had a chance to suppress the banner.
-//   3. It may have SetRadioInCar inlined by the compiler at this call site, so
-//      the method-level hook misses it entirely.
-//
-// All radio playback is handled by BASS streams in Main.cpp, so this native
-// function is completely redundant and safe to suppress entirely.
+// cDMAudio::SetRadioInCar — suppressed normally; allowed through for on-foot
+// interior ambient audio.
+static void __fastcall Hook_SetRadioInCar(cDMAudio* self, void* edx, unsigned int radio)
+{
+    if (LetNativeAudioRun())
+        gSetRadioInCarHook.thiscall<void>(self, radio);
+}
+
+// Vehicle radio audio-process function (0x5FB600) — reads the mouse wheel / radio
+// key, drives the HUD radio-name banner, and plays the radio (including interior
+// ambient music). Suppressed in the open world and in vehicles; allowed through
+// for on-foot interior ambient audio.
 static void __fastcall Hook_VehicleRadioProcess(void* self, void* edx)
 {
-    // Intentionally empty.
+    if (LetNativeAudioRun())
+        gRadioProcessHook.thiscall<void>(self);
 }
 
 // ---- SCM opcode interception: radio announcements + mission station changes ----
@@ -311,19 +326,12 @@ static void OnProcessOneCommand(SafetyHookContext& ctx)
     }
 
     // 041E SET_RADIO_CHANNEL: param 1 = station index, param 2 = play timecode
-    // in ms (-1 = continue). Decode param 2 (immediate OR variable).
-    unsigned char tcType = 0;
+    // in ms (-1 = continue). Decode param 2 (immediate OR variable); it stays -1
+    // if the parameter type is unsupported (we then fall back to our synced clock).
     int timecode = -1;
-    bool tcOk = ReadScmInt(self, ss, &off, &timecode, &tcType);
-    if (!tcOk) timecode = -1;
+    ReadScmInt(self, ss, &off, &timecode, nullptr);
     gPendingScmStationTime = timecode; // set time first, station last (the signal)
     gPendingScmStation = first;
-
-    // Diagnostic: record exactly what main.scm asked for so we can tell whether
-    // the intro pins a specific song (timecode) or just sets the station (-1).
-    gLog << "Hook 041E: station=" << first << " param2type=" << (int)tcType
-         << " param2=" << (tcOk ? timecode : -1) << std::endl;
-    gLog.flush();
 }
 
 class SwitchDetectorPlugin
@@ -332,8 +340,11 @@ public:
     SwitchDetectorPlugin()
     {
         injector::MakeJMP(0x4AA590, (void*)Hook_ChangeStationJustDown, true);
-        injector::MakeJMP(0x5F9730, (void*)Hook_SetRadioInCar, true);
-        injector::MakeJMP(0x5FB600, (void*)Hook_VehicleRadioProcess, true);
+        // Trampoline (inline) hooks so we can fall through to the original game
+        // code when on foot in an interior (see LetNativeAudioRun) — needed so
+        // interior ambient audio isn't silenced. Suppressed everywhere else.
+        gSetRadioInCarHook = safetyhook::create_inline((void*)0x5F9730, (void*)Hook_SetRadioInCar);
+        gRadioProcessHook  = safetyhook::create_inline((void*)0x5FB600, (void*)Hook_VehicleRadioProcess);
 
         // Watch the SCM dispatcher for opcodes 057D (announcements),
         // 041E (mission radio-station changes), 0394/03D1 (audio ducking).

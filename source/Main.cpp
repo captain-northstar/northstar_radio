@@ -56,6 +56,10 @@ bool gAmbientRadioEnabled = false;
 static HSTREAM gStream = 0;
 bool gWasInVehicle = false;
 
+// True while the player is inside a vehicle (updated every frame). Switch.cpp
+// reads this to decide whether on-foot interior ambient audio is allowed through.
+bool gPlayerInVehicle = false;
+
 // The vehicle instance the player is currently in (or was just in). Updated every
 // frame while inside a vehicle and used on exit to save the station to the correct
 // instance — m_pVehicle is already null on the exit frame (instantly so when
@@ -991,6 +995,7 @@ public:
 
                 CVehicle* pVehicle = pPlayer->m_pVehicle;
                 bool inVehicle = pPlayer->m_bInVehicle;
+                gPlayerInVehicle = inVehicle;
 
                 // Remember the current vehicle so we can save its station on exit
                 // (m_pVehicle is null on the exit frame, and the instant you're
