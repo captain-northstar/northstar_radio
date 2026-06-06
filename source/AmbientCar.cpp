@@ -33,6 +33,13 @@ static unsigned char* const pMusicVolume = (unsigned char*)0x86965A;
 
 // Declared in RadioVehicles.cpp
 extern std::map<int, std::vector<int>> gVehicleStationMap;
+bool IsNoRadioVehicle(int modelId);
+
+// Declared in Main.cpp — maps the 0..127 radio-volume slider to BASS 0.0..1.0.
+float RadioVolume(unsigned int pref);
+// Declared in Main.cpp — shared playback position; original stations start at 0,
+// added stations use the randomized offset.
+double StationTimelineMs(int index, bool applyStartOffset);
 
 // Ambient stream — only touched on main thread
 static HSTREAM gAmbientStream = 0;
@@ -165,7 +172,7 @@ static void AmbientLoadThread(int stationIndex)
     QWORD totalBytes = BASS_ChannelGetLength(stream, BASS_POS_BYTE);
     double totalMs = BASS_ChannelBytes2Seconds(stream, totalBytes) * 1000.0;
     if (totalMs > 0.0) {
-        double seekMs = fmod(gRadioTime, totalMs);
+        double seekMs = fmod(StationTimelineMs(stationIndex, false), totalMs);
         QWORD seekBytes = BASS_ChannelSeconds2Bytes(stream, seekMs / 1000.0);
         BASS_ChannelSetPosition(stream, seekBytes, BASS_POS_BYTE);
     }
@@ -267,6 +274,7 @@ public:
                         if (!pVeh) continue;
 
                         int modelId = pVeh->m_nModelIndex;
+                        if (IsNoRadioVehicle(modelId)) continue;  // [NORADIO]: no ambient either
                         auto it = gVehicleStationMap.find(modelId);
                         if (it == gVehicleStationMap.end()) continue;
 
@@ -307,7 +315,7 @@ public:
 
                 float distance = sqrtf(closestDistSq);
                 float volume = CalcVolume(distance);
-                float gameVol = (*pMusicVolume) / 64.0f;
+                float gameVol = RadioVolume(*pMusicVolume);
 
                 // Stream fully prepared in background — just play it
                 if (gAmbientStreamReady && !gAmbientStream) {

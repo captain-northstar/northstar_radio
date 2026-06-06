@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <algorithm>
 #include <windows.h>
 
@@ -21,16 +22,35 @@ extern int gPendingStation;
 extern std::string gScriptsFolder;
 extern std::ofstream gLog;
 
-// Timer: after leaving a car, keep same station for 5 seconds in any new car
-static DWORD gLastExitTick = 0;
+// The last station the player was listening to (set when leaving a vehicle).
+// Used only by RadioAutoTune to carry that station into the next vehicle.
 static int gLastStation = -1;
-static const DWORD KEEP_STATION_MS = 5000;
 
-// Per-vehicle saved station — keyed by vehicle pointer (unique per instance)
-static std::map<CVehicle*, int> gVehicleSavedStation;
+// [SETTINGS] RadioAutoTune: when 1, the station the player is listening to follows
+// them into EVERY vehicle they enter, regardless of distance. When 0 (default), a
+// different/new vehicle gets its own station (its [VEHICLES] assignment or random)
+// and the station does NOT carry over from the previous vehicle.
+static bool gRadioAutoTune = false;
+
+// Per-vehicle saved station — keyed by vehicle pointer (unique per instance).
+// We also remember the model id, so if VC's vehicle pool later reuses this exact
+// pointer for a DIFFERENT model, we discard the stale entry instead of playing
+// the previous vehicle's station in a fresh car.
+struct SavedStation { int station; int modelId; };
+static std::map<CVehicle*, SavedStation> gVehicleSavedStation;
 
 // Vehicle model ID -> list of station indices (pick randomly if multiple)
 std::map<int, std::vector<int>> gVehicleStationMap;
+
+// Vehicle model IDs that should have NO radio at all (from [NORADIO] section).
+// Takes precedence over everything: no music, no police radio, no announcements,
+// no ambient broadcast from this model.
+std::set<int> gNoRadioVehicles;
+
+bool IsNoRadioVehicle(int modelId)
+{
+    return gNoRadioVehicles.find(modelId) != gNoRadioVehicles.end();
+}
 
 static std::string ToLower(const std::string& s)
 {
@@ -56,6 +76,8 @@ static void LoadVehicleSection()
         };
 
     bool inVehicleSection = false;
+    bool inNoRadioSection = false;
+    bool inSettingsSection = false;
     int mapped = 0;
     std::string line;
 
@@ -74,6 +96,33 @@ static void LoadVehicleSection()
             std::string header = line;
             std::transform(header.begin(), header.end(), header.begin(), ::tolower);
             inVehicleSection = (header == "[vehicles]");
+            inNoRadioSection = (header == "[noradio]");
+            inSettingsSection = (header == "[settings]");
+            continue;
+        }
+
+        // [SETTINGS]: read the RadioAutoTune toggle (AmbientRadio etc. are read
+        // separately by Main.cpp's own INI loader).
+        if (inSettingsSection) {
+            size_t eq = line.find('=');
+            if (eq != std::string::npos) {
+                std::string key = line.substr(0, eq);
+                std::string val = line.substr(eq + 1);
+                trim(key);
+                trim(val);
+                if (ToLower(key) == "radioautotune")
+                    gRadioAutoTune = (atoi(val.c_str()) != 0);
+            }
+            continue;
+        }
+
+        // [NORADIO]: one numeric vehicle model ID per line = total radio silence
+        if (inNoRadioSection) {
+            int modelId = atoi(line.c_str());
+            if (modelId > 0) {
+                gNoRadioVehicles.insert(modelId);
+                gLog << "RadioVehicles: model " << modelId << " set to NO RADIO" << std::endl;
+            }
             continue;
         }
 
@@ -115,29 +164,40 @@ static void LoadVehicleSection()
         }
     }
 
-    gLog << "RadioVehicles: " << mapped << " entries mapped" << std::endl;
+    gLog << "RadioVehicles: " << mapped << " entries mapped, "
+         << gNoRadioVehicles.size() << " no-radio models" << std::endl;
+    gLog << "RadioVehicles: RadioAutoTune = " << (gRadioAutoTune ? 1 : 0) << std::endl;
     gLog.flush();
 }
 
 int GetStationForVehicle(CVehicle* pVehicle)
 {
-    // If this specific car has a saved station, resume it
-    auto saved = gVehicleSavedStation.find(pVehicle);
-    if (saved != gVehicleSavedStation.end()) {
-        int station = saved->second;
-        gLog << "RadioVehicles: resuming saved station [" << stations[station].name << "] for this vehicle" << std::endl;
+    // RadioAutoTune: the station the player is listening to follows them into EVERY
+    // vehicle, regardless of distance or which vehicle it is. Overrides per-vehicle
+    // memory and model defaults. Off by default.
+    if (gRadioAutoTune && gLastStation >= 0 && gLastStation < (int)stations.size()) {
+        gLog << "RadioVehicles: RadioAutoTune -> keeping [" << stations[gLastStation].name << "]" << std::endl;
         gLog.flush();
-        return station;
+        return gLastStation;
     }
 
-    // If within 5 seconds of leaving any car, keep the same station
-    if (gLastStation != -1 && gLastExitTick != 0) {
-        if (GetTickCount() - gLastExitTick < KEEP_STATION_MS) {
-            gLog << "RadioVehicles: keeping last station [" << stations[gLastStation].name << "] (within 5s)" << std::endl;
+    // If this specific vehicle instance has a saved station, resume it — but only
+    // if the model still matches (guards against the pool reusing this pointer for
+    // a different model). This is what makes a bike/car keep its station no matter
+    // how long the player is away, like stock VC.
+    auto saved = gVehicleSavedStation.find(pVehicle);
+    if (saved != gVehicleSavedStation.end()) {
+        if (saved->second.modelId == pVehicle->m_nModelIndex) {
+            int station = saved->second.station;
+            gLog << "RadioVehicles: resuming saved station [" << stations[station].name << "] for this vehicle" << std::endl;
             gLog.flush();
-            return gLastStation;
+            return station;
         }
+        gVehicleSavedStation.erase(saved); // stale pointer reused by a different model
     }
+
+    // (No time-based carry-over: a DIFFERENT/new vehicle gets its own station — its
+    // [VEHICLES] assignment or a random pick — unless RadioAutoTune is on, above.)
 
     // Look up vehicle model
     int modelId = pVehicle->m_nModelIndex;
@@ -176,18 +236,19 @@ int GetStationForVehicle(CVehicle* pVehicle)
 
 void OnPlayerExitVehicle(CVehicle* pVehicle)
 {
-    // Save the current station to this specific vehicle instance
+    // Save the current station to this specific vehicle instance so re-entering
+    // the SAME vehicle later resumes it regardless of how long we were away.
     int station = gCurrentStation != -1 ? gCurrentStation : gPendingStation;
-    if (station >= 0 && station < (int)stations.size()) {
-        gVehicleSavedStation[pVehicle] = station;
+    if (pVehicle && station >= 0 && station < (int)stations.size()) {
+        gVehicleSavedStation[pVehicle] = { station, pVehicle->m_nModelIndex };
         gLog << "RadioVehicles: saved [" << stations[station].name << "] to vehicle instance" << std::endl;
     }
 
-    // Also update the short-term timer for entering new cars
+    // Remember the last station the player was listening to — used only by
+    // RadioAutoTune to carry it into the next vehicle.
     gLastStation = station;
-    gLastExitTick = GetTickCount();
     if (station >= 0 && station < (int)stations.size())
-        gLog << "RadioVehicles: player exited, saving [" << stations[station].name << "] for 5s" << std::endl;
+        gLog << "RadioVehicles: player exited, last station was [" << stations[station].name << "]" << std::endl;
     gLog.flush();
 }
 
