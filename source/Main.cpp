@@ -1346,6 +1346,16 @@ public:
 
         Events::drawHudEvent.Add([]()
             {
+                // Re-pin the native vehicle radio to OFF right before the HUD draws.
+                // A fast-scroll race can briefly set a real native station between our
+                // per-frame cleanup passes; clamping here, just before the HUD renders,
+                // stops the stock radio-name banner flashing top-center behind ours.
+                if (gPlayerInVehicle && gActiveVehicle) {
+                    BYTE* ns = (BYTE*)((BYTE*)gActiveVehicle + 0x23C);
+                    if (*ns != 10)
+                        *ns = 10;
+                }
+
                 if (gStationNameToShow.empty()) return;
                 if (GetTickCount() - gStationNameTimer > STATION_NAME_DURATION) {
                     gStationNameToShow = "";

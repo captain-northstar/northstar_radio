@@ -2,11 +2,14 @@ NORTHSTAR RADIO
 
 Plugin for GTA VC that recreates the whole radio system from scratch, allowing you to add infinite amount of new radio stations, assign new default stations to vehicles and play ambient radio from traffic. Created with AI (Claude).
 
-Current version: 0.9.1
+Current version: 1.0.1
 
 CHANGELOG
 
-Version 0.9.1
+Version 1.0.1
+- Fixed a rare flash of the stock game radio-name banner (top-center, behind the new one) when scrolling through stations very quickly — the native radio display is now cleared right before the HUD renders, closing a fast-scroll timing gap.
+
+Version 1.0
 - Stronger suppression of the original radio: the stock Vice City radio and its on-screen station name are now fully disabled, so the game's radio can no longer play or switch underneath the plugin — including via mouse scroll, the radio key, and the controller button.
 - Station name display fixed: it now scales with the game resolution, is slightly larger, and no longer shows a black box behind it when other on-screen text is present.
 - Radio volume now matches the game: the new radio follows the menu's Radio Volume slider correctly (re-calibrated so it is no longer roughly twice as loud, and fully silent at zero). The radio pauses while the menu is open and the new level applies when you return to the game.
