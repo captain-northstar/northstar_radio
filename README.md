@@ -2,12 +2,16 @@ NORTHSTAR RADIO
 
 Plugin for GTA VC that recreates the whole radio system from scratch, allowing you to add infinite amount of new radio stations, assign new default stations to vehicles and play ambient radio from traffic. Created with AI (Claude).
 
-Current version: 1.0.1
+Current version: 1.1
 
 CHANGELOG
 
-Version 1.0.1
-- Fixed a rare flash of the stock game radio-name banner (top-center, behind the new one) when scrolling through stations very quickly — the native radio display is now cleared right before the HUD renders, closing a fast-scroll timing gap.
+Version 1.1
+- New radio-icon HUD: optionally show a station's icon instead of its text name when changing stations. Icons are loose PNGs in a "RadioHud" folder next to the asi, each named after its station; the plugin ships the nine Vice City station icons, the MP3 player, and a "radio off" icon. Turn it on/off with [SETTINGS] RadioIconHud (on by default), and size/position it with RadioIconScale and RadioIconY.
+- Custom-station icons: map any station to its own PNG in the new [STATIONICONS] section ("Station Name | texturename"), then drop texturename.png in the RadioHud folder. Stations with no icon fall back to the text name.
+- Hold to turn the radio off: holding the station-change button (keyboard key or controller button) for about 2.5 seconds turns the radio off; the same "Radio Off" state as scrolling past the last station. A quick tap still changes station.
+- Fixed a rare flash of the stock game radio-name banner (top-center, behind the new one) when scrolling through stations; the native radio display is now cleared right before the HUD renders.
+
 
 Version 1.0
 - Stronger suppression of the original radio: the stock Vice City radio and its on-screen station name are now fully disabled, so the game's radio can no longer play or switch underneath the plugin — including via mouse scroll, the radio key, and the controller button.
@@ -40,7 +44,7 @@ HOW TO INSTALL
 
 1. IMPORTANT: Download Ultimate ASI Loader (https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases) and install it. The plugin will not work without it.
 2. IMPORTANT: Download bass.dll (https://www.un4seen.com) and bass_fx.dll (https://www.un4seen.com/bass.html#addons), put them in the root folder of your GTA Vice City game. I cannot distribute these files, but plugin will not work without them.
-3. Put NorthstarRadio.asi and NorthstarRadio.ini into your root GTA Vice City folder or your "scripts" folder.
+3. Put NorthstarRadio.asi, NorthstarRadio.ini, and the RadioHud folder (the radio-station icons) into your root GTA Vice City folder or your "scripts" folder.
 4. Enjoy.
 
 HOW TO SET UP
@@ -87,6 +91,8 @@ HOW TO SET UP
 12. You can make a station open at a specific point in its broadcast through the [STARTOFFSET] section of INI file. Format: "Station Name | M:SS" (or plain seconds). The station will start from that position each launch instead of from the beginning. This is useful for recreating the original VC behaviour where the intro opens Flash FM on a specific song.
 13. You can make the radio follow you between vehicles with the RadioAutoTune option in the [SETTINGS] section. With RadioAutoTune = 1, whatever station you are listening to keeps playing when you get into any other vehicle, no matter the distance. With RadioAutoTune = 0 (default), each different/new vehicle uses its own assigned station or a random one, and the same vehicle still remembers its own station when you return to it.
 14. You can turn off the in-game script integration with the ScriptIntegration option in the [SETTINGS] section. With ScriptIntegration = 0 the plugin stops hooking the game's mission script, so you lose the story radio announcements, mission-forced station changes and audio ducking, but the rest of the radio works normally. This is meant for total-conversion mods that use a custom main.scm and crash when the script is hooked. Default is 1 (full integration).
+15. You can show station ICONS instead of the text name when changing stations. Set RadioIconHud = 1 in [SETTINGS] (on by default) and put PNG images in a "RadioHud" folder next to the asi, each named after its station's texture. The nine Vice City stations, the MP3 player and the "radio off" banner are mapped automatically (wild.png, flash.png, kchat.png, fever.png, vrock.png, vcpr.png, espan.png, emoti.png, wave.png, player.png, radiooff.png). For any other station, add a line to the [STATIONICONS] section as "Station Name | texturename" and put texturename.png in RadioHud. Adjust icon size with RadioIconScale and vertical position with RadioIconY (both fractions of screen height). A station with no matching PNG just shows its text name.
+16. You can turn the radio off by holding the station-change button. Holding the RadioSwitchNext key or the RadioSwitchNextPad controller button for about 2.5 seconds turns the radio off (same as scrolling past the last station); a quick tap still changes station. Mouse scroll always changes station (it cannot be held).
 
 HOW TO CODE
 

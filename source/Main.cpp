@@ -29,6 +29,11 @@ using namespace plugin;
 // Declared in Switch.cpp
 extern bool gSwitchNext;
 extern bool gSwitchPrev;
+extern bool gRadioOff;   // set by Switch.cpp when the switch button is held ~2.5s
+
+// Optional radio-icon HUD (defined in RadioIconHud.cpp, [SETTINGS] RadioIconHud=1).
+// Returns true if it drew an icon for the station (so we skip the text banner).
+bool DrawRadioStationIcon(const std::string& stationName, float resW, float resH, unsigned char alpha);
 
 // Declared in RadioVehicles.cpp
 int GetStationForVehicle(CVehicle* pVehicle);
@@ -1255,6 +1260,20 @@ public:
                     }
                 }
 
+                // Hold-to-off: the radio-switch button held ~2.5s sets gRadioOff in
+                // Switch.cpp. Turn the radio off — same path as scrolling past the
+                // last station; TurnRadioOff() shows the "Radio Off" banner.
+                if (gRadioOff) {
+                    gRadioOff = false;
+                    if (gWasInVehicle) {
+                        gSwitchNext = false;
+                        gSwitchPrev = false;
+                        gPendingStation = -1;
+                        gLastSwitchTick = 0;
+                        TurnRadioOff();
+                    }
+                }
+
                 if (gSwitchNext || gSwitchPrev) {
                     bool goNext = gSwitchNext;
                     gSwitchNext = false;
@@ -1364,6 +1383,12 @@ public:
 
                 float resW = (float)*pResWidth;
                 float resH = (float)*pResHeight;
+
+                // Experimental radio-icon HUD: if enabled and this station has an
+                // icon, draw it instead of the text name. Falls through to text
+                // for custom stations (no icon) or when the feature is off.
+                if (DrawRadioStationIcon(gStationNameToShow, resW, resH, 255))
+                    return;
 
                 // Scale relative to a 1920px-wide baseline, then bump ~10% so the
                 // station name reads a touch larger. (scale = 1.10 at 1920px,

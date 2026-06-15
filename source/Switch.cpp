@@ -21,6 +21,11 @@ extern std::ofstream gLog;
 bool gSwitchNext = false;
 bool gSwitchPrev = false;
 
+// Set true when the radio-switch button (keyboard or pad) is HELD ~2.5s — Main.cpp
+// then turns the radio off (the same "Radio Off" state as scrolling past the last
+// station). A quick tap of the same button still just changes station.
+bool gRadioOff = false;
+
 // Set by the SCM opcode hook below when the game's script fires opcode
 // 057D PLAY_ANNOUNCEMENT. -1 = nothing pending; 0 = bclosed, 1 = bopen.
 // Read (and reset) by Main.cpp on the main thread. The hook runs on the same
@@ -396,30 +401,44 @@ public:
                     *pMouseWheelDown = 0;
                 }
 
-                // Keyboard key — fires once per press
-                static bool gKeyWasDown = false;
+                // Radio-switch button (keyboard key OR controller button): a quick
+                // TAP changes station; a HOLD of ~2.5s turns the radio OFF (same as
+                // scrolling past the last station). The switch fires on RELEASE so a
+                // tap and a hold can be told apart. (Mouse scroll above stays tap-only.)
                 bool keyDown = (GetAsyncKeyState(gRadioSwitchNextKey) & 0x8000) != 0;
-                if (keyDown && !gKeyWasDown)
-                    gSwitchNext = true;
-                gKeyWasDown = keyDown;
-
-                // Controller button via XInput — checks all 4 ports
+                bool padDown = false;
                 if (gRadioSwitchNextPad != 0) {
-                    static bool gPadWasDown = false;
-                    bool padDown = false;
                     for (DWORD i = 0; i < XUSER_MAX_COUNT; i++) {
                         XINPUT_STATE state = {};
-                        if (XInputGetState(i, &state) == ERROR_SUCCESS) {
-                            if (state.Gamepad.wButtons & gRadioSwitchNextPad) {
-                                padDown = true;
-                                break;
-                            }
+                        if (XInputGetState(i, &state) == ERROR_SUCCESS &&
+                            (state.Gamepad.wButtons & gRadioSwitchNextPad)) {
+                            padDown = true;
+                            break;
                         }
                     }
-                    if (padDown && !gPadWasDown)
-                        gSwitchNext = true;
-                    gPadWasDown = padDown;
                 }
+                bool btnDown = keyDown || padDown;
+
+                static bool gBtnWasDown = false;
+                static DWORD gBtnDownTick = 0;
+                static bool gHoldFired = false;
+                const DWORD RADIO_OFF_HOLD_MS = 2500;
+
+                if (btnDown && !gBtnWasDown) {          // press started
+                    gBtnDownTick = GetTickCount();
+                    gHoldFired = false;
+                }
+                else if (btnDown && gBtnWasDown) {      // still held
+                    if (!gHoldFired && GetTickCount() - gBtnDownTick >= RADIO_OFF_HOLD_MS) {
+                        gRadioOff = true;               // held long enough -> off (once)
+                        gHoldFired = true;
+                    }
+                }
+                else if (!btnDown && gBtnWasDown) {     // released
+                    if (!gHoldFired)
+                        gSwitchNext = true;             // it was a tap -> change station
+                }
+                gBtnWasDown = btnDown;
             });
     }
 } switchDetectorPlugin;
