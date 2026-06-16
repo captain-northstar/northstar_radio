@@ -51,6 +51,7 @@
     <ClCompile Include="source\AmbientCar.cpp" />
     <ClCompile Include="source\Main.cpp" />
     <ClCompile Include="source\RadioVehicles.cpp" />
+    <ClCompile Include="source\RadioIconHud.cpp" />
     <ClCompile Include="source\Switch.cpp" />
   </ItemGroup>
   <ItemGroup>

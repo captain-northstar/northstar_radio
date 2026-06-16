@@ -21,6 +21,11 @@ extern std::ofstream gLog;
 bool gSwitchNext = false;
 bool gSwitchPrev = false;
 
+// Set true when the radio-switch button (keyboard or pad) is HELD ~2.5s — Main.cpp
+// then turns the radio off (the same "Radio Off" state as scrolling past the last
+// station). A quick tap of the same button still just changes station.
+bool gRadioOff = false;
+
 // Set by the SCM opcode hook below when the game's script fires opcode
 // 057D PLAY_ANNOUNCEMENT. -1 = nothing pending; 0 = bclosed, 1 = bopen.
 // Read (and reset) by Main.cpp on the main thread. The hook runs on the same
@@ -205,42 +210,48 @@ static bool __fastcall Hook_ChangeStationJustDown(CPad* self, void* edx)
     return false;
 }
 
-// Inline (trampoline) hooks for the native radio setter cDMAudio::SetRadioInCar
-// (0x5F9730) and the radio audio-process function (0x5FB600). Unlike a plain
-// no-op JMP, the trampoline lets us call the ORIGINAL when the player is on foot
-// inside an interior — so interiors that play ambient music/radio (clubs, shops,
-// etc.) work normally instead of being silenced. Everywhere else we suppress so
-// our BASS radio stays in charge.
-static SafetyHookInline gSetRadioInCarHook;
-static SafetyHookInline gRadioProcessHook;
+// Suppression of the native radio setter cDMAudio::SetRadioInCar (0x5F9730) and
+// the radio audio-process function (0x5FB600) — the function that reads the
+// scroll wheel / radio key, retunes, and draws the stock HUD radio-name banner.
+//
+// Done with plain injector::MakeJMP byte patches (JMP to a no-op), the technique
+// that has been reliable since 0.9. safetyhook inline trampolines were tried here
+// for the interior-audio fix but FAILED to install on some game EXEs, silently
+// leaving the native radio alive — wheel scrolls then retuned it and flashed the
+// stock banner behind ours. Instead, the original prologue bytes are saved at
+// startup so the patches can be LIFTED while the player is on foot inside an
+// interior (interior ambient music plays through these functions) and re-applied
+// on exit. The toggle lives in gameProcessEvent; both the patching and every call
+// to these functions happen on the game's main thread, so flipping the bytes at
+// a frame boundary is safe.
+static BYTE gOrigSetRadioInCar[5];
+static BYTE gOrigRadioProcess[5];
+static bool gNativeAudioAllowed = false; // false = patches applied (suppressed)
 
 extern bool gPlayerInVehicle; // defined in Main.cpp; updated every frame
 
-// Let the game's native radio / ambient audio run only when the player is on foot
-// inside an interior (CGame::currArea != 0). In the open world, or while in a
-// vehicle, we suppress (the BASS radio handles everything). Gating on "on foot"
-// too means a vehicle driven into an interior still uses our radio (no doubling).
-static bool LetNativeAudioRun()
-{
-    return CGame::currArea != 0 && !gPlayerInVehicle;
-}
-
-// cDMAudio::SetRadioInCar — suppressed normally; allowed through for on-foot
-// interior ambient audio.
+// Patch targets — never called while the patches are lifted.
 static void __fastcall Hook_SetRadioInCar(cDMAudio* self, void* edx, unsigned int radio)
 {
-    if (LetNativeAudioRun())
-        gSetRadioInCarHook.thiscall<void>(self, radio);
+    // Intentionally empty.
 }
 
-// Vehicle radio audio-process function (0x5FB600) — reads the mouse wheel / radio
-// key, drives the HUD radio-name banner, and plays the radio (including interior
-// ambient music). Suppressed in the open world and in vehicles; allowed through
-// for on-foot interior ambient audio.
 static void __fastcall Hook_VehicleRadioProcess(void* self, void* edx)
 {
-    if (LetNativeAudioRun())
-        gRadioProcessHook.thiscall<void>(self);
+    // Intentionally empty.
+}
+
+static void ApplyRadioSuppression(bool suppress)
+{
+    if (suppress) {
+        injector::MakeJMP(0x5F9730, (void*)Hook_SetRadioInCar, true);
+        injector::MakeJMP(0x5FB600, (void*)Hook_VehicleRadioProcess, true);
+    }
+    else {
+        injector::WriteMemoryRaw(0x5F9730, gOrigSetRadioInCar, sizeof(gOrigSetRadioInCar), true);
+        injector::WriteMemoryRaw(0x5FB600, gOrigRadioProcess, sizeof(gOrigRadioProcess), true);
+    }
+    gNativeAudioAllowed = !suppress;
 }
 
 // ---- SCM opcode interception: radio announcements + mission station changes ----
@@ -340,11 +351,12 @@ public:
     SwitchDetectorPlugin()
     {
         injector::MakeJMP(0x4AA590, (void*)Hook_ChangeStationJustDown, true);
-        // Trampoline (inline) hooks so we can fall through to the original game
-        // code when on foot in an interior (see LetNativeAudioRun) — needed so
-        // interior ambient audio isn't silenced. Suppressed everywhere else.
-        gSetRadioInCarHook = safetyhook::create_inline((void*)0x5F9730, (void*)Hook_SetRadioInCar);
-        gRadioProcessHook  = safetyhook::create_inline((void*)0x5FB600, (void*)Hook_VehicleRadioProcess);
+        // Save the original prologues, then suppress the native radio. The saved
+        // bytes let gameProcessEvent lift the patches while the player is on foot
+        // in an interior (so interior ambient music plays) and re-apply on exit.
+        injector::ReadMemoryRaw(0x5F9730, gOrigSetRadioInCar, sizeof(gOrigSetRadioInCar), true);
+        injector::ReadMemoryRaw(0x5FB600, gOrigRadioProcess, sizeof(gOrigRadioProcess), true);
+        ApplyRadioSuppression(true);
 
         // Watch the SCM dispatcher for opcodes 057D (announcements),
         // 041E (mission radio-station changes), 0394/03D1 (audio ducking).
@@ -362,12 +374,22 @@ public:
                          << (gScriptIntegrationEnabled ? "ENABLED"
                                                        : "DISABLED (SCM hook not installed)")
                          << std::endl;
+                    gLog << "RadioHooks: byte-patch suppression active (lifted on foot in interiors)" << std::endl;
                     gLog.flush();
                 }
             });
 
         Events::gameProcessEvent.Add([]()
             {
+                // Native radio pass-through toggle: lift the suppression patches
+                // only while the player is on foot inside an interior (clubs and
+                // shops play their ambient music through the patched functions);
+                // re-apply them everywhere else. Transitions are rare and happen
+                // on the main thread — the same thread that runs those functions.
+                bool allowNative = (CGame::currArea != 0) && !gPlayerInVehicle;
+                if (allowNative != gNativeAudioAllowed)
+                    ApplyRadioSuppression(!allowNative);
+
                 // Consume wheel bytes immediately so the native VC radio code path
                 // (which runs later in CGame::Process via DMAudio) never sees them.
                 if (*pMouseWheelUp) {
@@ -379,30 +401,44 @@ public:
                     *pMouseWheelDown = 0;
                 }
 
-                // Keyboard key — fires once per press
-                static bool gKeyWasDown = false;
+                // Radio-switch button (keyboard key OR controller button): a quick
+                // TAP changes station; a HOLD of ~2.5s turns the radio OFF (same as
+                // scrolling past the last station). The switch fires on RELEASE so a
+                // tap and a hold can be told apart. (Mouse scroll above stays tap-only.)
                 bool keyDown = (GetAsyncKeyState(gRadioSwitchNextKey) & 0x8000) != 0;
-                if (keyDown && !gKeyWasDown)
-                    gSwitchNext = true;
-                gKeyWasDown = keyDown;
-
-                // Controller button via XInput — checks all 4 ports
+                bool padDown = false;
                 if (gRadioSwitchNextPad != 0) {
-                    static bool gPadWasDown = false;
-                    bool padDown = false;
                     for (DWORD i = 0; i < XUSER_MAX_COUNT; i++) {
                         XINPUT_STATE state = {};
-                        if (XInputGetState(i, &state) == ERROR_SUCCESS) {
-                            if (state.Gamepad.wButtons & gRadioSwitchNextPad) {
-                                padDown = true;
-                                break;
-                            }
+                        if (XInputGetState(i, &state) == ERROR_SUCCESS &&
+                            (state.Gamepad.wButtons & gRadioSwitchNextPad)) {
+                            padDown = true;
+                            break;
                         }
                     }
-                    if (padDown && !gPadWasDown)
-                        gSwitchNext = true;
-                    gPadWasDown = padDown;
                 }
+                bool btnDown = keyDown || padDown;
+
+                static bool gBtnWasDown = false;
+                static DWORD gBtnDownTick = 0;
+                static bool gHoldFired = false;
+                const DWORD RADIO_OFF_HOLD_MS = 2500;
+
+                if (btnDown && !gBtnWasDown) {          // press started
+                    gBtnDownTick = GetTickCount();
+                    gHoldFired = false;
+                }
+                else if (btnDown && gBtnWasDown) {      // still held
+                    if (!gHoldFired && GetTickCount() - gBtnDownTick >= RADIO_OFF_HOLD_MS) {
+                        gRadioOff = true;               // held long enough -> off (once)
+                        gHoldFired = true;
+                    }
+                }
+                else if (!btnDown && gBtnWasDown) {     // released
+                    if (!gHoldFired)
+                        gSwitchNext = true;             // it was a tap -> change station
+                }
+                gBtnWasDown = btnDown;
             });
     }
 } switchDetectorPlugin;
