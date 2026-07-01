@@ -30,6 +30,9 @@ using namespace plugin;
 extern bool gSwitchNext;
 extern bool gSwitchPrev;
 extern bool gRadioOff;   // set by Switch.cpp when the switch button is held ~2.5s
+// Polls the radio-switch inputs and sets gSwitchNext/gSwitchPrev/gRadioOff. Called
+// at the top of gameProcessEvent so input is detected and processed in one frame.
+void PollRadioSwitchInput();
 
 // Optional radio-icon HUD (defined in RadioIconHud.cpp, [SETTINGS] RadioIconHud=1).
 // Returns true if it drew an icon for the station (so we skip the text banner).
@@ -64,6 +67,12 @@ bool gWasInVehicle = false;
 // True while the player is inside a vehicle (updated every frame). Switch.cpp
 // reads this to decide whether on-foot interior ambient audio is allowed through.
 bool gPlayerInVehicle = false;
+
+// True while the radio is paused / not running (pause menu, cutscene, or a
+// save-load teardown). Switch.cpp reads this to SWALLOW radio-switch input, so
+// pressing the change-station key / pad / wheel in the menu does not queue a
+// station change that fires the instant the menu closes. Updated every frame.
+bool gRadioInputBlocked = false;
 
 // The vehicle instance the player is currently in (or was just in). Updated every
 // frame while inside a vehicle and used on exit to save the station to the correct
@@ -543,7 +552,7 @@ static void GetMp3PlayerPosition(double radioTime, int& fileIndex, double& seekM
     seekMs = 0;
 }
 
-static void LoadStationThread(int index)
+static void LoadStationThreadImpl(int index)
 {
     if (index == gMp3StationIndex) {
         int fileIndex;
@@ -584,10 +593,22 @@ static void LoadStationThread(int index)
             return;
         }
 
-        buf = std::vector<BYTE>(
-            std::istreambuf_iterator<char>(f),
-            std::istreambuf_iterator<char>()
-        );
+        // Pre-size to the exact file length and read in one shot. The previous
+        // istreambuf_iterator construction grew the vector by repeated doubling,
+        // which transiently needs ~2x the file size (old + new block during each
+        // reallocation). These Reviced ADFs run 100-180 MB, so in a 32-bit (2 GB
+        // address space) process that spike could exhaust memory mid-load. Reading
+        // into a once-sized buffer removes the spike and is much faster. A failed
+        // allocation throws std::bad_alloc, which the LoadStationThread wrapper
+        // catches so the game survives instead of silently terminating.
+        f.seekg(0, std::ios::end);
+        std::streamoff len = f.tellg();
+        f.seekg(0, std::ios::beg);
+        if (len > 0) {
+            buf.resize((size_t)len);
+            f.read(reinterpret_cast<char*>(buf.data()), len);
+            buf.resize((size_t)f.gcount());
+        }
 
         for (auto& b : buf)
             b ^= 0x22;
@@ -602,6 +623,36 @@ static void LoadStationThread(int index)
     }
     gBufferReady = true;
     gLoadingInProgress = false;
+}
+
+// Runs on a detached background thread. Any uncaught exception here — most likely
+// std::bad_alloc when decoding a 100-180 MB Reviced ADF into memory in a 32-bit
+// (2 GB) process — would call std::terminate and kill the game with NO error
+// dialog (a silent close; MixMods never sees an SEH exception to report). Catch
+// everything so a failed load just skips the station and the game keeps running.
+static void LoadStationThread(int index)
+{
+    try {
+        LoadStationThreadImpl(index);
+    }
+    catch (const std::exception& e) {
+        gLog << "Thread: load aborted (" << e.what()
+             << ") — out of memory? station skipped, game kept alive" << std::endl;
+        gLog.flush();
+        {
+            std::lock_guard<std::mutex> lock(gLoadMutex);
+            gLoadedBuffer.clear();
+            gLoadedBuffer.shrink_to_fit();
+        }
+        gBufferReady = false;
+        gLoadingInProgress = false;
+    }
+    catch (...) {
+        gLog << "Thread: load aborted (unknown error) — station skipped" << std::endl;
+        gLog.flush();
+        gBufferReady = false;
+        gLoadingInProgress = false;
+    }
 }
 
 static void StartLoadingStation(int index)
@@ -934,6 +985,13 @@ public:
                 gRadioTime += (double)(now - gLastTick);
                 gLastTick = now;
 
+                // Detect radio-switch input (wheel / key / pad) up front, in the SAME
+                // frame it is consumed by the switch-handling block below, so the
+                // on-screen station name never trails the wheel during a fast scroll.
+                // (Detection previously lived in a separate Switch.cpp handler that
+                // could run a frame later, making the banner show the previous station.)
+                PollRadioSwitchInput();
+
                 // A save load / restart was requested from the menu: the world is
                 // being rebuilt, so keep the radio fully torn down and run no other
                 // logic until it's done. Without this the radio resumes over the
@@ -948,6 +1006,7 @@ public:
                     }
                     StopAndResetRadio();
                     gWasPaused = false;
+                    gRadioInputBlocked = true; // swallow switch input during teardown
                     return;
                 }
 
@@ -957,6 +1016,7 @@ public:
                     // don't leave a "was paused" flag that would resume a stale stream.
                     StopAndResetRadio();
                     gWasPaused = false;
+                    gRadioInputBlocked = true; // swallow switch input during teardown
                     return;
                 }
 
@@ -985,6 +1045,7 @@ public:
                 // Radio Volume level is applied on the way out (UpdateVolume below).
                 bool inCutscene = CCutsceneMgr::ms_running || TheCamera.m_bWideScreenOn;
                 bool isPaused = FrontEndMenuManager.m_bMenuActive || inCutscene;
+                gRadioInputBlocked = isPaused; // Switch.cpp swallows switch input while paused
                 if (isPaused && !gWasPaused) {
                     if (gStream) BASS_ChannelPause(gStream);
                     if (gSfxStaticStream) BASS_ChannelPause(gSfxStaticStream);
@@ -1369,8 +1430,17 @@ public:
                 // A fast-scroll race can briefly set a real native station between our
                 // per-frame cleanup passes; clamping here, just before the HUD renders,
                 // stops the stock radio-name banner flashing top-center behind ours.
-                if (gPlayerInVehicle && gActiveVehicle) {
-                    BYTE* ns = (BYTE*)((BYTE*)gActiveVehicle + 0x23C);
+                //
+                // Fetch the vehicle FRESH from the player rather than using the cached
+                // gActiveVehicle: on the vehicle-entry frame m_bInVehicle (which drives
+                // gPlayerInVehicle) can already be true while gActiveVehicle still points
+                // at a PREVIOUS, now-freed vehicle (it is only refreshed when m_pVehicle
+                // is non-null). Reading that stale pointer's +0x23C crashed on entry.
+                // m_pVehicle is the authoritative current vehicle and is null during the
+                // race, so validating it here closes the hole.
+                CPlayerPed* pHudPlayer = FindPlayerPed();
+                if (pHudPlayer && pHudPlayer->m_bInVehicle && pHudPlayer->m_pVehicle) {
+                    BYTE* ns = (BYTE*)((BYTE*)pHudPlayer->m_pVehicle + 0x23C);
                     if (*ns != 10)
                         *ns = 10;
                 }

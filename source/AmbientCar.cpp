@@ -113,7 +113,7 @@ static float CalcVolume(float distance)
 }
 
 // Everything heavy runs here — file I/O, decoding, stream creation, FX setup
-static void AmbientLoadThread(int stationIndex)
+static void AmbientLoadThreadImpl(int stationIndex)
 {
     if (stationIndex < 0 || stationIndex >= (int)stations.size()) {
         gAmbientLoadingInProgress = false;
@@ -132,11 +132,19 @@ static void AmbientLoadThread(int stationIndex)
             return;
         }
 
+        // Pre-size and read in one shot rather than growing via istreambuf_iterator
+        // (which briefly needs ~2x the file size). These ADFs run 100-180 MB in
+        // Reviced; the spike could exhaust the 32-bit address space. bad_alloc here
+        // is caught by the AmbientLoadThread wrapper so the game survives.
         std::vector<BYTE> buf;
-        buf.assign(
-            std::istreambuf_iterator<char>(f),
-            std::istreambuf_iterator<char>()
-        );
+        f.seekg(0, std::ios::end);
+        std::streamoff len = f.tellg();
+        f.seekg(0, std::ios::beg);
+        if (len > 0) {
+            buf.resize((size_t)len);
+            f.read(reinterpret_cast<char*>(buf.data()), len);
+            buf.resize((size_t)f.gcount());
+        }
         f.close();
 
         for (size_t i = 0; i < buf.size(); i++)
@@ -207,6 +215,27 @@ static void AmbientLoadThread(int stationIndex)
 
     gAmbientStreamReady = true;
     gAmbientLoadingInProgress = false;
+}
+
+// Detached background thread — same silent-crash hazard as the player-radio loader:
+// an uncaught std::bad_alloc while decoding a large ADF into gAmbientBuf would
+// std::terminate the game with no error dialog. Catch everything so a failed
+// ambient load just gives up quietly and the game keeps running.
+static void AmbientLoadThread(int stationIndex)
+{
+    try {
+        AmbientLoadThreadImpl(stationIndex);
+    }
+    catch (const std::exception& e) {
+        gLog << "Ambient: load aborted (" << e.what() << ") — skipped" << std::endl;
+        gLog.flush();
+        gAmbientStreamReady = false;
+        gAmbientLoadingInProgress = false;
+    }
+    catch (...) {
+        gAmbientStreamReady = false;
+        gAmbientLoadingInProgress = false;
+    }
 }
 
 static void StartAmbientLoad(int stationIndex, CVehicle* pVehicle)

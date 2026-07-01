@@ -228,7 +228,8 @@ static BYTE gOrigSetRadioInCar[5];
 static BYTE gOrigRadioProcess[5];
 static bool gNativeAudioAllowed = false; // false = patches applied (suppressed)
 
-extern bool gPlayerInVehicle; // defined in Main.cpp; updated every frame
+extern bool gPlayerInVehicle;    // defined in Main.cpp; updated every frame
+extern bool gRadioInputBlocked;  // defined in Main.cpp; true while paused (menu/cutscene/load)
 
 // Patch targets — never called while the patches are lifted.
 static void __fastcall Hook_SetRadioInCar(cDMAudio* self, void* edx, unsigned int radio)
@@ -345,6 +346,76 @@ static void OnProcessOneCommand(SafetyHookContext& ctx)
     gPendingScmStation = first;
 }
 
+// Polls the radio-switch inputs (mouse wheel + configured key / pad, plus the
+// hold-to-off timer) and sets the shared gSwitchNext / gSwitchPrev / gRadioOff
+// flags. Main.cpp calls this at the TOP of its own gameProcessEvent, immediately
+// before it consumes those flags, so a scroll is detected and acted on in the SAME
+// frame — this is what keeps the on-screen station name from trailing the wheel by
+// a frame during a fast spin. The VC mouse-wheel bytes are consumed every frame so
+// the native radio code path never sees them, even while paused.
+void PollRadioSwitchInput()
+{
+    bool wheelUp = *pMouseWheelUp != 0;
+    bool wheelDown = *pMouseWheelDown != 0;
+    *pMouseWheelUp = 0;
+    *pMouseWheelDown = 0;
+
+    // Radio-switch button (keyboard key OR controller button): a quick TAP changes
+    // station; a HOLD of ~2.5s turns the radio OFF (same as scrolling past the last
+    // station). The switch fires on RELEASE so a tap and a hold can be told apart.
+    // (Mouse scroll above stays tap-only.)
+    bool keyDown = (GetAsyncKeyState(gRadioSwitchNextKey) & 0x8000) != 0;
+    bool padDown = false;
+    if (gRadioSwitchNextPad != 0) {
+        for (DWORD i = 0; i < XUSER_MAX_COUNT; i++) {
+            XINPUT_STATE state = {};
+            if (XInputGetState(i, &state) == ERROR_SUCCESS &&
+                (state.Gamepad.wButtons & gRadioSwitchNextPad)) {
+                padDown = true;
+                break;
+            }
+        }
+    }
+    bool btnDown = keyDown || padDown;
+
+    static bool sBtnWasDown = false;
+    static DWORD sBtnDownTick = 0;
+    static bool sHoldFired = false;
+    const DWORD RADIO_OFF_HOLD_MS = 2500;
+
+    // While the pause menu / cutscene is up the radio is paused and must not change.
+    // GetAsyncKeyState / XInput read the physical device even then, so swallow all
+    // switch input here (the wheel bytes are already consumed above) and reset the
+    // hold tracker, so an in-menu press or a hold spanning the pause is not
+    // registered and does not fire a switch the moment the menu closes.
+    if (gRadioInputBlocked) {
+        sBtnWasDown = false;
+        sHoldFired = false;
+        return;
+    }
+
+    if (wheelUp)
+        gSwitchNext = true;
+    if (wheelDown)
+        gSwitchPrev = true;
+
+    if (btnDown && !sBtnWasDown) {          // press started
+        sBtnDownTick = GetTickCount();
+        sHoldFired = false;
+    }
+    else if (btnDown && sBtnWasDown) {      // still held
+        if (!sHoldFired && GetTickCount() - sBtnDownTick >= RADIO_OFF_HOLD_MS) {
+            gRadioOff = true;               // held long enough -> off (once)
+            sHoldFired = true;
+        }
+    }
+    else if (!btnDown && sBtnWasDown) {     // released
+        if (!sHoldFired)
+            gSwitchNext = true;             // it was a tap -> change station
+    }
+    sBtnWasDown = btnDown;
+}
+
 class SwitchDetectorPlugin
 {
 public:
@@ -390,55 +461,12 @@ public:
                 if (allowNative != gNativeAudioAllowed)
                     ApplyRadioSuppression(!allowNative);
 
-                // Consume wheel bytes immediately so the native VC radio code path
-                // (which runs later in CGame::Process via DMAudio) never sees them.
-                if (*pMouseWheelUp) {
-                    gSwitchNext = true;
-                    *pMouseWheelUp = 0;
-                }
-                if (*pMouseWheelDown) {
-                    gSwitchPrev = true;
-                    *pMouseWheelDown = 0;
-                }
-
-                // Radio-switch button (keyboard key OR controller button): a quick
-                // TAP changes station; a HOLD of ~2.5s turns the radio OFF (same as
-                // scrolling past the last station). The switch fires on RELEASE so a
-                // tap and a hold can be told apart. (Mouse scroll above stays tap-only.)
-                bool keyDown = (GetAsyncKeyState(gRadioSwitchNextKey) & 0x8000) != 0;
-                bool padDown = false;
-                if (gRadioSwitchNextPad != 0) {
-                    for (DWORD i = 0; i < XUSER_MAX_COUNT; i++) {
-                        XINPUT_STATE state = {};
-                        if (XInputGetState(i, &state) == ERROR_SUCCESS &&
-                            (state.Gamepad.wButtons & gRadioSwitchNextPad)) {
-                            padDown = true;
-                            break;
-                        }
-                    }
-                }
-                bool btnDown = keyDown || padDown;
-
-                static bool gBtnWasDown = false;
-                static DWORD gBtnDownTick = 0;
-                static bool gHoldFired = false;
-                const DWORD RADIO_OFF_HOLD_MS = 2500;
-
-                if (btnDown && !gBtnWasDown) {          // press started
-                    gBtnDownTick = GetTickCount();
-                    gHoldFired = false;
-                }
-                else if (btnDown && gBtnWasDown) {      // still held
-                    if (!gHoldFired && GetTickCount() - gBtnDownTick >= RADIO_OFF_HOLD_MS) {
-                        gRadioOff = true;               // held long enough -> off (once)
-                        gHoldFired = true;
-                    }
-                }
-                else if (!btnDown && gBtnWasDown) {     // released
-                    if (!gHoldFired)
-                        gSwitchNext = true;             // it was a tap -> change station
-                }
-                gBtnWasDown = btnDown;
+                // NOTE: radio-switch input polling (mouse wheel + key / pad, and the
+                // hold-to-off detection) now happens in PollRadioSwitchInput(), which
+                // Main.cpp calls at the TOP of its gameProcessEvent — the same frame it
+                // consumes the flags. That guarantees a scroll is detected and acted on
+                // in one frame regardless of handler order, so the on-screen station
+                // name no longer trails the wheel by a frame during a fast spin.
             });
     }
 } switchDetectorPlugin;
