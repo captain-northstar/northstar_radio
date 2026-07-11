@@ -61,6 +61,12 @@ std::string gScriptsFolder;
 std::ofstream gLog;
 bool gAmbientRadioEnabled = false;
 
+// [SETTINGS] AmbientRadio3D — 3D drive-by effect for the ambient car radio:
+// stereo panning that follows the car relative to the camera, plus a doppler
+// pitch shift from the closing speed, updated every frame from the live vehicle
+// position. 0 = the old flat, volume-only behaviour. Read in AmbientCar.cpp.
+bool gAmbient3DEnabled = true;
+
 static HSTREAM gStream = 0;
 bool gWasInVehicle = false;
 
@@ -876,6 +882,8 @@ static void LoadINI()
                 std::transform(key.begin(), key.end(), key.begin(), ::tolower);
                 if (key == "ambientradio")
                     gAmbientRadioEnabled = (val == "1");
+                else if (key == "ambientradio3d")
+                    gAmbient3DEnabled = (val == "1");
             }
             continue;
         }
