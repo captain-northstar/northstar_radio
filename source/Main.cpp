@@ -8,6 +8,7 @@
 #include "CFont.h"
 #include "CControllerConfigManager.h"
 #include "CCutsceneMgr.h"
+#include "CGame.h"      // CGame::currArea — 0 = main world, non-zero = interior
 #include "CCamera.h"
 #include "bass.h"
 #include <fstream>
@@ -560,7 +561,17 @@ static void GetMp3PlayerPosition(double radioTime, int& fileIndex, double& seekM
 
 static void LoadStationThreadImpl(int index)
 {
-    if (index == gMp3StationIndex) {
+    if (index == gMp3StationIndex && gMp3StationIndex >= 0) {
+        // gMp3StationIndex stays -1 when no MP3 files were found; without the
+        // >= 0 check a request for station -1 ("off") lands here and indexes an
+        // empty vector — a silent worker-thread crash (c0000005, no dialog).
+        if (gMp3Files.empty()) {
+            gLog << "MP3 PLAYER requested but playlist is empty — ignored" << std::endl;
+            gLog.flush();
+            gBufferReady = false;
+            gLoadingInProgress = false;
+            return;
+        }
         int fileIndex;
         double seekMs;
         GetMp3PlayerPosition(gRadioTime, fileIndex, seekMs);
@@ -666,6 +677,15 @@ static void StartLoadingStation(int index)
     if (gLoadingInProgress)
         return;
 
+    // Reject invalid station indexes outright (-1 = radio off/unset). Besides
+    // being meaningless to load, -1 used to alias gMp3StationIndex when no MP3
+    // files exist and crashed the loader thread on an empty playlist.
+    if (index < 0 || (index >= (int)stations.size() && index != gMp3StationIndex)) {
+        gLog << "StartLoadingStation: invalid station " << index << " ignored" << std::endl;
+        gLog.flush();
+        return;
+    }
+
     gBufferReady = false;
     gLoadingInProgress = true;
     gLoadingStation = index;
@@ -679,7 +699,7 @@ static void PlayLoadedStation(int index)
     StopStaticSound();
     gWaitingToPlay = false;
 
-    if (index == gMp3StationIndex) {
+    if (index == gMp3StationIndex && gMp3StationIndex >= 0) {
         std::string filePath;
         double seekMs;
         {
@@ -1080,7 +1100,16 @@ public:
                 // ===== No-radio vehicles ([NORADIO] section): total silence =====
                 // Checked before everything else so it overrides music, police
                 // radio and announcements alike.
-                if (inVehicle && pVehicle && IsNoRadioVehicle(pVehicle->m_nModelIndex)) {
+                //
+                // Also covers the stadium challenges (hotring, bloodring, dirt ring):
+                // the original game disables the car radio for those, and they put the
+                // player in a vehicle INSIDE an interior — which never happens in VC
+                // otherwise, so it is a reliable signal. They do NOT use opcode 041E
+                // (confirmed: no 041E is fired during them), so the script path cannot
+                // catch them; the area check is what actually works.
+                bool inInteriorVehicle = inVehicle && (CGame::currArea != 0);
+                if (inVehicle && ((pVehicle && IsNoRadioVehicle(pVehicle->m_nModelIndex))
+                                  || inInteriorVehicle)) {
                     if (!gNoRadioVehicle) {
                         StopRadio();
                         StopStaticSound();
@@ -1094,7 +1123,11 @@ public:
                         gBufferReady = false;
                         gAnnouncementPlaying = false;
                         gStationNameToShow = "";     // no banner
-                        gLog << "No-radio vehicle (model " << pVehicle->m_nModelIndex << "): radio disabled" << std::endl;
+                        if (inInteriorVehicle)
+                            gLog << "Stadium/interior event (area " << CGame::currArea
+                                 << "): radio disabled" << std::endl;
+                        else
+                            gLog << "No-radio vehicle (model " << pVehicle->m_nModelIndex << "): radio disabled" << std::endl;
                         gLog.flush();
                     }
                     // Swallow any input or queued announcement so nothing can turn it on.
@@ -1185,7 +1218,35 @@ public:
                 }
 
                 if (gWasInVehicle && gWaitingToPlay && gBufferReady) {
-                    PlayLoadedStation(gLoadingStation);
+                    if (gPendingStation != -1) {
+                        // The player switched again while this station was loading,
+                        // so it is now stale. Drop it WITHOUT playing and WITHOUT
+                        // touching the tuning static: the debounce below loads the
+                        // pending station next, and the static keeps playing right
+                        // through until the station the player actually lands on
+                        // starts. (Playing this stale one stopped the static, and the
+                        // pending reload then left a multi-second silent gap on big
+                        // ADFs — which read as "the radio just stops playing".)
+                        gBufferReady = false;
+                        gWaitingToPlay = false;
+                        gLog << "Stale load dropped (newer switch pending), static kept" << std::endl;
+                        gLog.flush();
+                    }
+                    else {
+                        PlayLoadedStation(gLoadingStation);
+                    }
+                }
+                else if (gWaitingToPlay && !gLoadingInProgress && !gBufferReady
+                         && gPendingStation == -1) {
+                    // We are waiting for audio that will never arrive: the loader
+                    // thread gave up (missing file, empty MP3 playlist, out of
+                    // memory) and nothing is queued behind it. The tuning static is
+                    // only ever stopped by PlayLoadedStation, so without this it
+                    // would loop forever until the player changed station again.
+                    gWaitingToPlay = false;
+                    StopStaticSound();
+                    gLog << "Load produced nothing — tuning static stopped" << std::endl;
+                    gLog.flush();
                 }
 
                 // ===== Radio announcements (opcode 057D: 0 = bclosed, 1 = bopen) =====
@@ -1218,6 +1279,14 @@ public:
                             gBufferReady = false;
                             StartLoadingStation(gCurrentStation);
                             gLog << "Announcement finished, resuming station" << std::endl;
+                            gLog.flush();
+                        }
+                        else {
+                            // Radio was off: free the finished announcement stream and
+                            // stay silent. Leaving the stopped stream in gStream let the
+                            // MP3-advance check below misfire on it next frame.
+                            StopRadio();
+                            gLog << "Announcement finished, radio stays off" << std::endl;
                             gLog.flush();
                         }
                         UpdateVolume();
@@ -1312,12 +1381,41 @@ public:
                             StartLoadingStation(scmStation);
                             gLog.flush();
                         }
-                        // station 9/10 (off), out of range, or unchanged: nothing to do
+                        else if (scmStation >= 9) {
+                            // 9/10 = "radio off" in VC. Missions use this to silence
+                            // the car radio — the stadium challenges (hotring,
+                            // bloodring, dirt ring) do exactly this in the original
+                            // game. We used to ignore it and keep playing. Stop
+                            // cleanly and stay off; the next vehicle the player gets
+                            // into picks its station normally. No "Radio Off" banner:
+                            // this is scripted silence, not the player switching off.
+                            if (gCurrentStation != -1 || gStream || gWaitingToPlay) {
+                                StopRadio();
+                                StopStaticSound();
+                                {
+                                    std::lock_guard<std::mutex> lock(gLoadMutex);
+                                    gLoadedBuffer.clear();
+                                }
+                                gBufferReady = false;
+                                gWaitingToPlay = false;
+                                gPendingStation = -1;
+                                gLastSwitchTick = 0;
+                                gCurrentStation = -1;
+                                gStationNameToShow = "";
+                                gLog << "SCM 041E: radio off (script)" << std::endl;
+                                gLog.flush();
+                            }
+                        }
+                        // out of range or unchanged: nothing to do
                     }
                 }
 
-                // MP3 PLAYER: advance to next file when current ends
-                if (gCurrentStation == gMp3StationIndex && gStream) {
+                // MP3 PLAYER: advance to next file when current ends.
+                // gMp3StationIndex >= 0 is required: with no MP3 files it stays -1
+                // and would alias gCurrentStation == -1 (radio off) — with a stale
+                // stopped stream (e.g. a finished announcement) this "advanced" a
+                // nonexistent playlist and crashed the loader thread.
+                if (gMp3StationIndex >= 0 && gCurrentStation == gMp3StationIndex && gStream) {
                     if (BASS_ChannelIsActive(gStream) == BASS_ACTIVE_STOPPED) {
                         StopRadio();
                         {
@@ -1383,7 +1481,17 @@ public:
                 }
 
                 if (gPendingStation != -1 && gLastSwitchTick != 0) {
-                    if (GetTickCount() - gLastSwitchTick >= SWITCH_DEBOUNCE_MS) {
+                    // Only consume the request once a load can actually start.
+                    // StartLoadingStation silently returns while another load is
+                    // running, so consuming it here (clearing gPendingStation) used
+                    // to DROP the switch entirely: nothing retried, no station ever
+                    // played, and because the tuning static is only stopped by
+                    // PlayLoadedStation it looped forever until the player changed
+                    // station again. Large ADFs take seconds to load, so switching
+                    // mid-load hit this constantly. Leaving the request armed makes
+                    // it retry on a later frame instead.
+                    if (!gLoadingInProgress &&
+                        GetTickCount() - gLastSwitchTick >= SWITCH_DEBOUNCE_MS) {
                         int next = gPendingStation;
                         gPendingStation = -1;
                         gLastSwitchTick = 0;

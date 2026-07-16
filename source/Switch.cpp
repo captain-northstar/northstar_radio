@@ -452,14 +452,31 @@ public:
 
         Events::gameProcessEvent.Add([]()
             {
-                // Native radio pass-through toggle: lift the suppression patches
-                // only while the player is on foot inside an interior (clubs and
-                // shops play their ambient music through the patched functions);
-                // re-apply them everywhere else. Transitions are rare and happen
-                // on the main thread — the same thread that runs those functions.
+                // Native radio pass-through toggle: lift the suppression patches only
+                // while the player is on foot inside an interior (clubs and shops play
+                // their ambient music through the patched functions); re-apply them
+                // everywhere else.
+                //
+                // We deliberately do NOT lift them while DRIVING inside an interior.
+                // Tried that to fix the stadium challenges (hotring / bloodring / dirt
+                // ring) but it re-applied the byte patches at the exact frame the event
+                // ends and the player teleports out (area -> 0), colliding with the
+                // game's audio teardown and crashing inside gta-vc.exe. Silencing our
+                // radio during those events is handled separately and cleanly in
+                // Main.cpp (a vehicle inside an interior is treated as no-radio), which
+                // needs no native patching. Transitions are rare and happen on the main
+                // thread — the same thread that runs those functions.
                 bool allowNative = (CGame::currArea != 0) && !gPlayerInVehicle;
-                if (allowNative != gNativeAudioAllowed)
+                if (allowNative != gNativeAudioAllowed) {
                     ApplyRadioSuppression(!allowNative);
+                    if (gLog.is_open()) {
+                        gLog << "RadioHooks: native audio "
+                             << (allowNative ? "ALLOWED" : "suppressed")
+                             << " (area " << CGame::currArea
+                             << ", inVehicle " << (gPlayerInVehicle ? 1 : 0) << ")" << std::endl;
+                        gLog.flush();
+                    }
+                }
 
                 // NOTE: radio-switch input polling (mouse wheel + key / pad, and the
                 // hold-to-off detection) now happens in PollRadioSwitchInput(), which
