@@ -355,10 +355,21 @@ static void OnProcessOneCommand(SafetyHookContext& ctx)
 // the native radio code path never sees them, even while paused.
 void PollRadioSwitchInput()
 {
-    bool wheelUp = *pMouseWheelUp != 0;
-    bool wheelDown = *pMouseWheelDown != 0;
-    *pMouseWheelUp = 0;
-    *pMouseWheelDown = 0;
+    // While the frontend menu / cutscene is up (gRadioInputBlocked), DON'T read or
+    // clear the mouse wheel. MenuMapVC and other menu plugins read the very same
+    // bytes (CPad::NewMouseControllerState.wheelUp/.wheelDown, 0x94D78B/C) to zoom
+    // the map, and this poll runs at the top of the frame — clearing them here every
+    // frame starved the map zoom (keyboard PageUp/Down kept working because that is
+    // separate key state). The radio is paused in the menu and doesn't need the
+    // wheel. During gameplay we still consume it so a scroll never leaks to the
+    // native radio (retune / stock banner flash).
+    bool wheelUp = false, wheelDown = false;
+    if (!gRadioInputBlocked) {
+        wheelUp = *pMouseWheelUp != 0;
+        wheelDown = *pMouseWheelDown != 0;
+        *pMouseWheelUp = 0;
+        *pMouseWheelDown = 0;
+    }
 
     // Radio-switch button (keyboard key OR controller button): a quick TAP changes
     // station; a HOLD of ~2.5s turns the radio OFF (same as scrolling past the last

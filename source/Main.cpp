@@ -1097,6 +1097,16 @@ public:
                 if (inVehicle && pVehicle)
                     gActiveVehicle = pVehicle;
 
+                // Ped state (+0x244): 50 = seated & driving, 60 = EXIT_CAR (the exit
+                // task has begun — the frame the game accepts the exit button), 57 =
+                // DRAG_FM_CAR (being pulled out / carjacked). The original game cut
+                // the car radio the moment the exit STARTED, not when the exit
+                // animation finished (m_bInVehicle only clears then), so "exit has
+                // begun" is treated exactly like "out of the vehicle" below.
+                DWORD pedState = *(DWORD*)((BYTE*)pPlayer + 0x244);
+                bool playerExiting = gWasInVehicle && inVehicle
+                                     && (pedState == 60 || pedState == 57);
+
                 // ===== No-radio vehicles ([NORADIO] section): total silence =====
                 // Checked before everything else so it overrides music, police
                 // radio and announcements alike.
@@ -1141,7 +1151,7 @@ public:
                     return;
                 }
 
-                if (inVehicle && pVehicle && pVehicle->IsLawEnforcementVehicle()) {
+                if (inVehicle && pVehicle && !playerExiting && pVehicle->IsLawEnforcementVehicle()) {
                     if (!gPoliceRadioPlaying) {
                         StopRadio();
                         StopStaticSound();
@@ -1201,8 +1211,7 @@ public:
                     gLastNativeStation = -1;
                 }
 
-                DWORD pedState = *(DWORD*)((BYTE*)pPlayer + 0x244);
-                bool isSeated = (pedState == 0x32);
+                bool isSeated = (pedState == 0x32); // pedState read above (50 = driving)
 
                 if (isSeated && !gWasInVehicle && pVehicle) {
                     gWasInVehicle = true;
@@ -1257,9 +1266,9 @@ public:
                 }
 
                 if (gAnnouncementPlaying) {
-                    if (!inVehicle) {
-                        // Player left the car mid-announcement: stop it and let the
-                        // normal "exited vehicle" logic below take over.
+                    if (!inVehicle || playerExiting) {
+                        // Player left (or began leaving) the car mid-announcement:
+                        // stop it and let the "exited vehicle" logic below take over.
                         StopRadio();
                         gAnnouncementPlaying = false;
                         gQueuedAnnouncement = -1;
@@ -1507,7 +1516,12 @@ public:
                     }
                 }
 
-                if (!inVehicle && gWasInVehicle) {
+                // Exit handling — fires the frame the exit BEGINS (playerExiting,
+                // matching the original game's instant radio cut on the exit press)
+                // or, as a fallback, when m_bInVehicle finally clears (knocked off a
+                // bike, warped out, or any exit that never passed through EXIT_CAR).
+                // gWasInVehicle goes false right here, so this runs exactly once.
+                if ((!inVehicle || playerExiting) && gWasInVehicle) {
                     OnPlayerExitVehicle(gActiveVehicle ? gActiveVehicle : pVehicle);
                     gActiveVehicle = nullptr;
                     StopRadio();
