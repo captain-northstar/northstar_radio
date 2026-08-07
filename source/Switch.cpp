@@ -1,5 +1,6 @@
 #include "plugin.h"
 #include "CPad.h"
+#include "CPlayerPed.h"
 #include "cDMAudio.h"
 #include "CRunningScript.h"
 #include "CTheScripts.h"
@@ -456,7 +457,7 @@ public:
                          << (gScriptIntegrationEnabled ? "ENABLED"
                                                        : "DISABLED (SCM hook not installed)")
                          << std::endl;
-                    gLog << "RadioHooks: byte-patch suppression active (lifted in interiors)" << std::endl;
+                    gLog << "RadioHooks: byte-patch suppression active (lifted on foot in interiors)" << std::endl;
                     gLog.flush();
                 }
             });
@@ -485,24 +486,65 @@ public:
                 // and the wheel bytes are consumed before native code can see them.
                 // Transitions are rare and happen on the main thread — the same thread
                 // that runs those functions.
-                const DWORD NATIVE_SETTLE_MS = 2000;
-                bool inInterior = (CGame::currArea != 0);
-                static DWORD sLeftInteriorTick = 0;
-                if (inInterior)
-                    sLeftInteriorTick = 0;
-                else if (sLeftInteriorTick == 0 && gNativeAudioAllowed)
-                    sLeftInteriorTick = GetTickCount();   // just left — start settling
+                // The player is in a vehicle, or has STARTED getting into one. Checked
+                // from the ped's task state, not just m_bInVehicle: that only turns true
+                // once the player is SEATED, about a second after the entry animation
+                // begins, and the game assigns the car its station inside that gap —
+                // long enough for the native side to LATCH its stock name banner (which
+                // is latched at retune, so pinning the station byte back to 10 a frame
+                // later cannot un-draw it). Read live from the ped rather than via
+                // gPlayerInVehicle, which is a frame stale depending on handler order.
+                CPlayerPed* pPed = FindPlayerPed();
+                bool vehicleBusy = gPlayerInVehicle;
+                if (pPed) {
+                    DWORD st = *(DWORD*)((BYTE*)pPed + 0x244);
+                    vehicleBusy = pPed->m_bInVehicle
+                        || st == 24   // SEEK_CAR
+                        || st == 50   // DRIVING
+                        || st == 51   // PASSENGER
+                        || st == 52   // TAXI_PASSNGR
+                        || st == 53   // OPEN_DOOR
+                        || st == 56   // CARJACK
+                        || st == 58   // ENTER_CAR
+                        || st == 59   // STEAL_CAR
+                        || st == 60;  // EXIT_CAR
+                }
 
-                bool settling = !inInterior && sLeftInteriorTick != 0 &&
-                                (GetTickCount() - sLeftInteriorTick) < NATIVE_SETTLE_MS;
-                bool allowNative = inInterior || settling;
+                // Native audio is allowed ONLY while the player is on foot inside an
+                // interior — never anywhere near a vehicle, so the native side can never
+                // latch a station banner. No timing window is involved any more.
+                //
+                // The reason a timed window was needed before: a patched (no-op)
+                // function cannot STOP a sound the game already started, so re-patching
+                // while interior music was playing froze it and it played forever.
+                // Fixed properly below by telling the game to stop it first.
+                bool allowNative = (CGame::currArea != 0) && !vehicleBusy;
+
                 if (allowNative != gNativeAudioAllowed) {
+                    if (!allowNative) {
+                        // About to re-apply the patches. VC plays interior/club/stadium
+                        // music THROUGH the radio system (that is why these patches
+                        // silence it), so ask the game to switch that radio off while
+                        // its setter is still live. The sound is then already stopped
+                        // when the no-op patch lands, instead of being frozen mid-play.
+                        // Deterministic — no settle window, and it covers every exit
+                        // (walking out, getting into the event car, or being placed
+                        // outside still sitting in a vehicle).
+                        //
+                        // Safe to call here, unlike the per-frame call this replaces:
+                        // that one also ran during the event-end teleport/teardown,
+                        // which is what crashed inside gta-vc.exe. By the time an event
+                        // ends the player is already in the event vehicle, so the
+                        // patches are applied and this transition has long since passed.
+                        const unsigned int RADIO_OFF = 10;
+                        DMAudio.SetRadioInCar(RADIO_OFF);
+                    }
                     ApplyRadioSuppression(!allowNative);
                     if (gLog.is_open()) {
                         gLog << "RadioHooks: native audio "
-                             << (allowNative ? "ALLOWED" : "suppressed")
+                             << (allowNative ? "ALLOWED" : "suppressed (native radio switched off first)")
                              << " (area " << CGame::currArea
-                             << ", inVehicle " << (gPlayerInVehicle ? 1 : 0) << ")" << std::endl;
+                             << ", vehicle " << (vehicleBusy ? 1 : 0) << ")" << std::endl;
                         gLog.flush();
                     }
                 }
