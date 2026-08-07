@@ -456,28 +456,46 @@ public:
                          << (gScriptIntegrationEnabled ? "ENABLED"
                                                        : "DISABLED (SCM hook not installed)")
                          << std::endl;
-                    gLog << "RadioHooks: byte-patch suppression active (lifted on foot in interiors)" << std::endl;
+                    gLog << "RadioHooks: byte-patch suppression active (lifted in interiors)" << std::endl;
                     gLog.flush();
                 }
             });
 
         Events::gameProcessEvent.Add([]()
             {
-                // Native radio pass-through toggle: lift the suppression patches only
-                // while the player is on foot inside an interior (clubs and shops play
-                // their ambient music through the patched functions); re-apply them
-                // everywhere else.
+                // Native radio pass-through toggle: lift the suppression patches for
+                // the WHOLE time the player is inside an interior — on foot or driving.
+                // Interiors play their own music/crowd audio through these functions,
+                // and a patched (no-op) function cannot STOP a sound the game already
+                // started. Re-patching when the player got into the event car inside the
+                // stadium therefore froze that audio mid-play, and the stadium music
+                // kept going after the event ended (until a pause re-synced audio).
                 //
-                // We deliberately do NOT lift them while DRIVING inside an interior.
-                // Tried that to fix the stadium challenges (hotring / bloodring / dirt
-                // ring) but it re-applied the byte patches at the exact frame the event
-                // ends and the player teleports out (area -> 0), colliding with the
-                // game's audio teardown and crashing inside gta-vc.exe. Silencing our
-                // radio during those events is handled separately and cleanly in
-                // Main.cpp (a vehicle inside an interior is treated as no-radio), which
-                // needs no native patching. Transitions are rare and happen on the main
-                // thread — the same thread that runs those functions.
-                bool allowNative = (CGame::currArea != 0) && !gPlayerInVehicle;
+                // A settle window keeps them lifted briefly AFTER the interior is left:
+                // the native code has to run at least once with the new area to notice
+                // it should stop the interior music, so re-patching on the exact
+                // transition frame would strand the music playing all over again.
+                //
+                // This was tried once before and crashed at event exit — that crash was
+                // the DMAudio.SetRadioInCar(10) call in Main.cpp executing the real
+                // native setter during the game's teardown on that frame. That call is
+                // now gone, so lifting here is safe. The stock car radio still cannot
+                // come back while driving: the vehicle's station byte is pinned to 10
+                // (off) every frame in drawHudEvent, the radio key stays patched out,
+                // and the wheel bytes are consumed before native code can see them.
+                // Transitions are rare and happen on the main thread — the same thread
+                // that runs those functions.
+                const DWORD NATIVE_SETTLE_MS = 2000;
+                bool inInterior = (CGame::currArea != 0);
+                static DWORD sLeftInteriorTick = 0;
+                if (inInterior)
+                    sLeftInteriorTick = 0;
+                else if (sLeftInteriorTick == 0 && gNativeAudioAllowed)
+                    sLeftInteriorTick = GetTickCount();   // just left — start settling
+
+                bool settling = !inInterior && sLeftInteriorTick != 0 &&
+                                (GetTickCount() - sLeftInteriorTick) < NATIVE_SETTLE_MS;
+                bool allowNative = inInterior || settling;
                 if (allowNative != gNativeAudioAllowed) {
                     ApplyRadioSuppression(!allowNative);
                     if (gLog.is_open()) {

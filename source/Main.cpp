@@ -1179,8 +1179,16 @@ public:
                     gWaitingToPlay = false;
                 }
 
-                if (inVehicle)
-                    DMAudio.SetRadioInCar(10);
+                // NOTE: we used to call DMAudio.SetRadioInCar(10) here every frame to
+                // tell the native system "radio off". It was removed: 0x5F9730 is
+                // byte-patched to a no-op for all of normal gameplay, so the call did
+                // nothing — EXCEPT on the frames the patches are lifted (inside an
+                // interior), where it ran the REAL native setter. On the frame a
+                // stadium event ends (area -> 0, player teleported out, vehicle being
+                // torn down) this handler can run before the suppression toggle
+                // re-patches, executing the native setter mid-teardown — which is what
+                // crashed inside gta-vc.exe at event exit. The vehicle's station byte
+                // is pinned to 10 every frame in drawHudEvent, so nothing is lost.
 
                 // Detect SCM opcode station changes via native radio byte
                 if (inVehicle && pVehicle) {
