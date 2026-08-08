@@ -8,6 +8,7 @@
 #include "CFont.h"
 #include "CControllerConfigManager.h"
 #include "CCutsceneMgr.h"
+#include "CGame.h"      // CGame::currArea — 0 = main world, non-zero = interior
 #include "CCamera.h"
 #include "bass.h"
 #include <fstream>
@@ -30,6 +31,9 @@ using namespace plugin;
 extern bool gSwitchNext;
 extern bool gSwitchPrev;
 extern bool gRadioOff;   // set by Switch.cpp when the switch button is held ~2.5s
+// Polls the radio-switch inputs and sets gSwitchNext/gSwitchPrev/gRadioOff. Called
+// at the top of gameProcessEvent so input is detected and processed in one frame.
+void PollRadioSwitchInput();
 
 // Optional radio-icon HUD (defined in RadioIconHud.cpp, [SETTINGS] RadioIconHud=1).
 // Returns true if it drew an icon for the station (so we skip the text banner).
@@ -58,12 +62,24 @@ std::string gScriptsFolder;
 std::ofstream gLog;
 bool gAmbientRadioEnabled = false;
 
+// [SETTINGS] AmbientRadio3D — 3D drive-by effect for the ambient car radio:
+// stereo panning that follows the car relative to the camera, plus a doppler
+// pitch shift from the closing speed, updated every frame from the live vehicle
+// position. 0 = the old flat, volume-only behaviour. Read in AmbientCar.cpp.
+bool gAmbient3DEnabled = true;
+
 static HSTREAM gStream = 0;
 bool gWasInVehicle = false;
 
 // True while the player is inside a vehicle (updated every frame). Switch.cpp
 // reads this to decide whether on-foot interior ambient audio is allowed through.
 bool gPlayerInVehicle = false;
+
+// True while the radio is paused / not running (pause menu, cutscene, or a
+// save-load teardown). Switch.cpp reads this to SWALLOW radio-switch input, so
+// pressing the change-station key / pad / wheel in the menu does not queue a
+// station change that fires the instant the menu closes. Updated every frame.
+bool gRadioInputBlocked = false;
 
 // The vehicle instance the player is currently in (or was just in). Updated every
 // frame while inside a vehicle and used on exit to save the station to the correct
@@ -543,9 +559,19 @@ static void GetMp3PlayerPosition(double radioTime, int& fileIndex, double& seekM
     seekMs = 0;
 }
 
-static void LoadStationThread(int index)
+static void LoadStationThreadImpl(int index)
 {
-    if (index == gMp3StationIndex) {
+    if (index == gMp3StationIndex && gMp3StationIndex >= 0) {
+        // gMp3StationIndex stays -1 when no MP3 files were found; without the
+        // >= 0 check a request for station -1 ("off") lands here and indexes an
+        // empty vector — a silent worker-thread crash (c0000005, no dialog).
+        if (gMp3Files.empty()) {
+            gLog << "MP3 PLAYER requested but playlist is empty — ignored" << std::endl;
+            gLog.flush();
+            gBufferReady = false;
+            gLoadingInProgress = false;
+            return;
+        }
         int fileIndex;
         double seekMs;
         GetMp3PlayerPosition(gRadioTime, fileIndex, seekMs);
@@ -584,10 +610,22 @@ static void LoadStationThread(int index)
             return;
         }
 
-        buf = std::vector<BYTE>(
-            std::istreambuf_iterator<char>(f),
-            std::istreambuf_iterator<char>()
-        );
+        // Pre-size to the exact file length and read in one shot. The previous
+        // istreambuf_iterator construction grew the vector by repeated doubling,
+        // which transiently needs ~2x the file size (old + new block during each
+        // reallocation). These Reviced ADFs run 100-180 MB, so in a 32-bit (2 GB
+        // address space) process that spike could exhaust memory mid-load. Reading
+        // into a once-sized buffer removes the spike and is much faster. A failed
+        // allocation throws std::bad_alloc, which the LoadStationThread wrapper
+        // catches so the game survives instead of silently terminating.
+        f.seekg(0, std::ios::end);
+        std::streamoff len = f.tellg();
+        f.seekg(0, std::ios::beg);
+        if (len > 0) {
+            buf.resize((size_t)len);
+            f.read(reinterpret_cast<char*>(buf.data()), len);
+            buf.resize((size_t)f.gcount());
+        }
 
         for (auto& b : buf)
             b ^= 0x22;
@@ -604,10 +642,49 @@ static void LoadStationThread(int index)
     gLoadingInProgress = false;
 }
 
+// Runs on a detached background thread. Any uncaught exception here — most likely
+// std::bad_alloc when decoding a 100-180 MB Reviced ADF into memory in a 32-bit
+// (2 GB) process — would call std::terminate and kill the game with NO error
+// dialog (a silent close; MixMods never sees an SEH exception to report). Catch
+// everything so a failed load just skips the station and the game keeps running.
+static void LoadStationThread(int index)
+{
+    try {
+        LoadStationThreadImpl(index);
+    }
+    catch (const std::exception& e) {
+        gLog << "Thread: load aborted (" << e.what()
+             << ") — out of memory? station skipped, game kept alive" << std::endl;
+        gLog.flush();
+        {
+            std::lock_guard<std::mutex> lock(gLoadMutex);
+            gLoadedBuffer.clear();
+            gLoadedBuffer.shrink_to_fit();
+        }
+        gBufferReady = false;
+        gLoadingInProgress = false;
+    }
+    catch (...) {
+        gLog << "Thread: load aborted (unknown error) — station skipped" << std::endl;
+        gLog.flush();
+        gBufferReady = false;
+        gLoadingInProgress = false;
+    }
+}
+
 static void StartLoadingStation(int index)
 {
     if (gLoadingInProgress)
         return;
+
+    // Reject invalid station indexes outright (-1 = radio off/unset). Besides
+    // being meaningless to load, -1 used to alias gMp3StationIndex when no MP3
+    // files exist and crashed the loader thread on an empty playlist.
+    if (index < 0 || (index >= (int)stations.size() && index != gMp3StationIndex)) {
+        gLog << "StartLoadingStation: invalid station " << index << " ignored" << std::endl;
+        gLog.flush();
+        return;
+    }
 
     gBufferReady = false;
     gLoadingInProgress = true;
@@ -622,7 +699,7 @@ static void PlayLoadedStation(int index)
     StopStaticSound();
     gWaitingToPlay = false;
 
-    if (index == gMp3StationIndex) {
+    if (index == gMp3StationIndex && gMp3StationIndex >= 0) {
         std::string filePath;
         double seekMs;
         {
@@ -825,6 +902,8 @@ static void LoadINI()
                 std::transform(key.begin(), key.end(), key.begin(), ::tolower);
                 if (key == "ambientradio")
                     gAmbientRadioEnabled = (val == "1");
+                else if (key == "ambientradio3d")
+                    gAmbient3DEnabled = (val == "1");
             }
             continue;
         }
@@ -934,6 +1013,13 @@ public:
                 gRadioTime += (double)(now - gLastTick);
                 gLastTick = now;
 
+                // Detect radio-switch input (wheel / key / pad) up front, in the SAME
+                // frame it is consumed by the switch-handling block below, so the
+                // on-screen station name never trails the wheel during a fast scroll.
+                // (Detection previously lived in a separate Switch.cpp handler that
+                // could run a frame later, making the banner show the previous station.)
+                PollRadioSwitchInput();
+
                 // A save load / restart was requested from the menu: the world is
                 // being rebuilt, so keep the radio fully torn down and run no other
                 // logic until it's done. Without this the radio resumes over the
@@ -948,6 +1034,7 @@ public:
                     }
                     StopAndResetRadio();
                     gWasPaused = false;
+                    gRadioInputBlocked = true; // swallow switch input during teardown
                     return;
                 }
 
@@ -957,6 +1044,7 @@ public:
                     // don't leave a "was paused" flag that would resume a stale stream.
                     StopAndResetRadio();
                     gWasPaused = false;
+                    gRadioInputBlocked = true; // swallow switch input during teardown
                     return;
                 }
 
@@ -985,6 +1073,7 @@ public:
                 // Radio Volume level is applied on the way out (UpdateVolume below).
                 bool inCutscene = CCutsceneMgr::ms_running || TheCamera.m_bWideScreenOn;
                 bool isPaused = FrontEndMenuManager.m_bMenuActive || inCutscene;
+                gRadioInputBlocked = isPaused; // Switch.cpp swallows switch input while paused
                 if (isPaused && !gWasPaused) {
                     if (gStream) BASS_ChannelPause(gStream);
                     if (gSfxStaticStream) BASS_ChannelPause(gSfxStaticStream);
@@ -1008,10 +1097,29 @@ public:
                 if (inVehicle && pVehicle)
                     gActiveVehicle = pVehicle;
 
+                // Ped state (+0x244): 50 = seated & driving, 60 = EXIT_CAR (the exit
+                // task has begun — the frame the game accepts the exit button), 57 =
+                // DRAG_FM_CAR (being pulled out / carjacked). The original game cut
+                // the car radio the moment the exit STARTED, not when the exit
+                // animation finished (m_bInVehicle only clears then), so "exit has
+                // begun" is treated exactly like "out of the vehicle" below.
+                DWORD pedState = *(DWORD*)((BYTE*)pPlayer + 0x244);
+                bool playerExiting = gWasInVehicle && inVehicle
+                                     && (pedState == 60 || pedState == 57);
+
                 // ===== No-radio vehicles ([NORADIO] section): total silence =====
                 // Checked before everything else so it overrides music, police
                 // radio and announcements alike.
-                if (inVehicle && pVehicle && IsNoRadioVehicle(pVehicle->m_nModelIndex)) {
+                //
+                // Also covers the stadium challenges (hotring, bloodring, dirt ring):
+                // the original game disables the car radio for those, and they put the
+                // player in a vehicle INSIDE an interior — which never happens in VC
+                // otherwise, so it is a reliable signal. They do NOT use opcode 041E
+                // (confirmed: no 041E is fired during them), so the script path cannot
+                // catch them; the area check is what actually works.
+                bool inInteriorVehicle = inVehicle && (CGame::currArea != 0);
+                if (inVehicle && ((pVehicle && IsNoRadioVehicle(pVehicle->m_nModelIndex))
+                                  || inInteriorVehicle)) {
                     if (!gNoRadioVehicle) {
                         StopRadio();
                         StopStaticSound();
@@ -1025,7 +1133,11 @@ public:
                         gBufferReady = false;
                         gAnnouncementPlaying = false;
                         gStationNameToShow = "";     // no banner
-                        gLog << "No-radio vehicle (model " << pVehicle->m_nModelIndex << "): radio disabled" << std::endl;
+                        if (inInteriorVehicle)
+                            gLog << "Stadium/interior event (area " << CGame::currArea
+                                 << "): radio disabled" << std::endl;
+                        else
+                            gLog << "No-radio vehicle (model " << pVehicle->m_nModelIndex << "): radio disabled" << std::endl;
                         gLog.flush();
                     }
                     // Swallow any input or queued announcement so nothing can turn it on.
@@ -1039,7 +1151,7 @@ public:
                     return;
                 }
 
-                if (inVehicle && pVehicle && pVehicle->IsLawEnforcementVehicle()) {
+                if (inVehicle && pVehicle && !playerExiting && pVehicle->IsLawEnforcementVehicle()) {
                     if (!gPoliceRadioPlaying) {
                         StopRadio();
                         StopStaticSound();
@@ -1067,8 +1179,16 @@ public:
                     gWaitingToPlay = false;
                 }
 
-                if (inVehicle)
-                    DMAudio.SetRadioInCar(10);
+                // NOTE: we used to call DMAudio.SetRadioInCar(10) here every frame to
+                // tell the native system "radio off". It was removed: 0x5F9730 is
+                // byte-patched to a no-op for all of normal gameplay, so the call did
+                // nothing — EXCEPT on the frames the patches are lifted (inside an
+                // interior), where it ran the REAL native setter. On the frame a
+                // stadium event ends (area -> 0, player teleported out, vehicle being
+                // torn down) this handler can run before the suppression toggle
+                // re-patches, executing the native setter mid-teardown — which is what
+                // crashed inside gta-vc.exe at event exit. The vehicle's station byte
+                // is pinned to 10 every frame in drawHudEvent, so nothing is lost.
 
                 // Detect SCM opcode station changes via native radio byte
                 if (inVehicle && pVehicle) {
@@ -1099,8 +1219,7 @@ public:
                     gLastNativeStation = -1;
                 }
 
-                DWORD pedState = *(DWORD*)((BYTE*)pPlayer + 0x244);
-                bool isSeated = (pedState == 0x32);
+                bool isSeated = (pedState == 0x32); // pedState read above (50 = driving)
 
                 if (isSeated && !gWasInVehicle && pVehicle) {
                     gWasInVehicle = true;
@@ -1116,7 +1235,35 @@ public:
                 }
 
                 if (gWasInVehicle && gWaitingToPlay && gBufferReady) {
-                    PlayLoadedStation(gLoadingStation);
+                    if (gPendingStation != -1) {
+                        // The player switched again while this station was loading,
+                        // so it is now stale. Drop it WITHOUT playing and WITHOUT
+                        // touching the tuning static: the debounce below loads the
+                        // pending station next, and the static keeps playing right
+                        // through until the station the player actually lands on
+                        // starts. (Playing this stale one stopped the static, and the
+                        // pending reload then left a multi-second silent gap on big
+                        // ADFs — which read as "the radio just stops playing".)
+                        gBufferReady = false;
+                        gWaitingToPlay = false;
+                        gLog << "Stale load dropped (newer switch pending), static kept" << std::endl;
+                        gLog.flush();
+                    }
+                    else {
+                        PlayLoadedStation(gLoadingStation);
+                    }
+                }
+                else if (gWaitingToPlay && !gLoadingInProgress && !gBufferReady
+                         && gPendingStation == -1) {
+                    // We are waiting for audio that will never arrive: the loader
+                    // thread gave up (missing file, empty MP3 playlist, out of
+                    // memory) and nothing is queued behind it. The tuning static is
+                    // only ever stopped by PlayLoadedStation, so without this it
+                    // would loop forever until the player changed station again.
+                    gWaitingToPlay = false;
+                    StopStaticSound();
+                    gLog << "Load produced nothing — tuning static stopped" << std::endl;
+                    gLog.flush();
                 }
 
                 // ===== Radio announcements (opcode 057D: 0 = bclosed, 1 = bopen) =====
@@ -1127,9 +1274,9 @@ public:
                 }
 
                 if (gAnnouncementPlaying) {
-                    if (!inVehicle) {
-                        // Player left the car mid-announcement: stop it and let the
-                        // normal "exited vehicle" logic below take over.
+                    if (!inVehicle || playerExiting) {
+                        // Player left (or began leaving) the car mid-announcement:
+                        // stop it and let the "exited vehicle" logic below take over.
                         StopRadio();
                         gAnnouncementPlaying = false;
                         gQueuedAnnouncement = -1;
@@ -1149,6 +1296,14 @@ public:
                             gBufferReady = false;
                             StartLoadingStation(gCurrentStation);
                             gLog << "Announcement finished, resuming station" << std::endl;
+                            gLog.flush();
+                        }
+                        else {
+                            // Radio was off: free the finished announcement stream and
+                            // stay silent. Leaving the stopped stream in gStream let the
+                            // MP3-advance check below misfire on it next frame.
+                            StopRadio();
+                            gLog << "Announcement finished, radio stays off" << std::endl;
                             gLog.flush();
                         }
                         UpdateVolume();
@@ -1243,12 +1398,41 @@ public:
                             StartLoadingStation(scmStation);
                             gLog.flush();
                         }
-                        // station 9/10 (off), out of range, or unchanged: nothing to do
+                        else if (scmStation >= 9) {
+                            // 9/10 = "radio off" in VC. Missions use this to silence
+                            // the car radio — the stadium challenges (hotring,
+                            // bloodring, dirt ring) do exactly this in the original
+                            // game. We used to ignore it and keep playing. Stop
+                            // cleanly and stay off; the next vehicle the player gets
+                            // into picks its station normally. No "Radio Off" banner:
+                            // this is scripted silence, not the player switching off.
+                            if (gCurrentStation != -1 || gStream || gWaitingToPlay) {
+                                StopRadio();
+                                StopStaticSound();
+                                {
+                                    std::lock_guard<std::mutex> lock(gLoadMutex);
+                                    gLoadedBuffer.clear();
+                                }
+                                gBufferReady = false;
+                                gWaitingToPlay = false;
+                                gPendingStation = -1;
+                                gLastSwitchTick = 0;
+                                gCurrentStation = -1;
+                                gStationNameToShow = "";
+                                gLog << "SCM 041E: radio off (script)" << std::endl;
+                                gLog.flush();
+                            }
+                        }
+                        // out of range or unchanged: nothing to do
                     }
                 }
 
-                // MP3 PLAYER: advance to next file when current ends
-                if (gCurrentStation == gMp3StationIndex && gStream) {
+                // MP3 PLAYER: advance to next file when current ends.
+                // gMp3StationIndex >= 0 is required: with no MP3 files it stays -1
+                // and would alias gCurrentStation == -1 (radio off) — with a stale
+                // stopped stream (e.g. a finished announcement) this "advanced" a
+                // nonexistent playlist and crashed the loader thread.
+                if (gMp3StationIndex >= 0 && gCurrentStation == gMp3StationIndex && gStream) {
                     if (BASS_ChannelIsActive(gStream) == BASS_ACTIVE_STOPPED) {
                         StopRadio();
                         {
@@ -1314,7 +1498,17 @@ public:
                 }
 
                 if (gPendingStation != -1 && gLastSwitchTick != 0) {
-                    if (GetTickCount() - gLastSwitchTick >= SWITCH_DEBOUNCE_MS) {
+                    // Only consume the request once a load can actually start.
+                    // StartLoadingStation silently returns while another load is
+                    // running, so consuming it here (clearing gPendingStation) used
+                    // to DROP the switch entirely: nothing retried, no station ever
+                    // played, and because the tuning static is only stopped by
+                    // PlayLoadedStation it looped forever until the player changed
+                    // station again. Large ADFs take seconds to load, so switching
+                    // mid-load hit this constantly. Leaving the request armed makes
+                    // it retry on a later frame instead.
+                    if (!gLoadingInProgress &&
+                        GetTickCount() - gLastSwitchTick >= SWITCH_DEBOUNCE_MS) {
                         int next = gPendingStation;
                         gPendingStation = -1;
                         gLastSwitchTick = 0;
@@ -1330,7 +1524,12 @@ public:
                     }
                 }
 
-                if (!inVehicle && gWasInVehicle) {
+                // Exit handling — fires the frame the exit BEGINS (playerExiting,
+                // matching the original game's instant radio cut on the exit press)
+                // or, as a fallback, when m_bInVehicle finally clears (knocked off a
+                // bike, warped out, or any exit that never passed through EXIT_CAR).
+                // gWasInVehicle goes false right here, so this runs exactly once.
+                if ((!inVehicle || playerExiting) && gWasInVehicle) {
                     OnPlayerExitVehicle(gActiveVehicle ? gActiveVehicle : pVehicle);
                     gActiveVehicle = nullptr;
                     StopRadio();
@@ -1369,8 +1568,17 @@ public:
                 // A fast-scroll race can briefly set a real native station between our
                 // per-frame cleanup passes; clamping here, just before the HUD renders,
                 // stops the stock radio-name banner flashing top-center behind ours.
-                if (gPlayerInVehicle && gActiveVehicle) {
-                    BYTE* ns = (BYTE*)((BYTE*)gActiveVehicle + 0x23C);
+                //
+                // Fetch the vehicle FRESH from the player rather than using the cached
+                // gActiveVehicle: on the vehicle-entry frame m_bInVehicle (which drives
+                // gPlayerInVehicle) can already be true while gActiveVehicle still points
+                // at a PREVIOUS, now-freed vehicle (it is only refreshed when m_pVehicle
+                // is non-null). Reading that stale pointer's +0x23C crashed on entry.
+                // m_pVehicle is the authoritative current vehicle and is null during the
+                // race, so validating it here closes the hole.
+                CPlayerPed* pHudPlayer = FindPlayerPed();
+                if (pHudPlayer && pHudPlayer->m_bInVehicle && pHudPlayer->m_pVehicle) {
+                    BYTE* ns = (BYTE*)((BYTE*)pHudPlayer->m_pVehicle + 0x23C);
                     if (*ns != 10)
                         *ns = 10;
                 }

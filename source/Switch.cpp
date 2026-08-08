@@ -1,5 +1,6 @@
 #include "plugin.h"
 #include "CPad.h"
+#include "CPlayerPed.h"
 #include "cDMAudio.h"
 #include "CRunningScript.h"
 #include "CTheScripts.h"
@@ -228,7 +229,8 @@ static BYTE gOrigSetRadioInCar[5];
 static BYTE gOrigRadioProcess[5];
 static bool gNativeAudioAllowed = false; // false = patches applied (suppressed)
 
-extern bool gPlayerInVehicle; // defined in Main.cpp; updated every frame
+extern bool gPlayerInVehicle;    // defined in Main.cpp; updated every frame
+extern bool gRadioInputBlocked;  // defined in Main.cpp; true while paused (menu/cutscene/load)
 
 // Patch targets — never called while the patches are lifted.
 static void __fastcall Hook_SetRadioInCar(cDMAudio* self, void* edx, unsigned int radio)
@@ -345,6 +347,87 @@ static void OnProcessOneCommand(SafetyHookContext& ctx)
     gPendingScmStation = first;
 }
 
+// Polls the radio-switch inputs (mouse wheel + configured key / pad, plus the
+// hold-to-off timer) and sets the shared gSwitchNext / gSwitchPrev / gRadioOff
+// flags. Main.cpp calls this at the TOP of its own gameProcessEvent, immediately
+// before it consumes those flags, so a scroll is detected and acted on in the SAME
+// frame — this is what keeps the on-screen station name from trailing the wheel by
+// a frame during a fast spin. The VC mouse-wheel bytes are consumed every frame so
+// the native radio code path never sees them, even while paused.
+void PollRadioSwitchInput()
+{
+    // While the frontend menu / cutscene is up (gRadioInputBlocked), DON'T read or
+    // clear the mouse wheel. MenuMapVC and other menu plugins read the very same
+    // bytes (CPad::NewMouseControllerState.wheelUp/.wheelDown, 0x94D78B/C) to zoom
+    // the map, and this poll runs at the top of the frame — clearing them here every
+    // frame starved the map zoom (keyboard PageUp/Down kept working because that is
+    // separate key state). The radio is paused in the menu and doesn't need the
+    // wheel. During gameplay we still consume it so a scroll never leaks to the
+    // native radio (retune / stock banner flash).
+    bool wheelUp = false, wheelDown = false;
+    if (!gRadioInputBlocked) {
+        wheelUp = *pMouseWheelUp != 0;
+        wheelDown = *pMouseWheelDown != 0;
+        *pMouseWheelUp = 0;
+        *pMouseWheelDown = 0;
+    }
+
+    // Radio-switch button (keyboard key OR controller button): a quick TAP changes
+    // station; a HOLD of ~2.5s turns the radio OFF (same as scrolling past the last
+    // station). The switch fires on RELEASE so a tap and a hold can be told apart.
+    // (Mouse scroll above stays tap-only.)
+    bool keyDown = (GetAsyncKeyState(gRadioSwitchNextKey) & 0x8000) != 0;
+    bool padDown = false;
+    if (gRadioSwitchNextPad != 0) {
+        for (DWORD i = 0; i < XUSER_MAX_COUNT; i++) {
+            XINPUT_STATE state = {};
+            if (XInputGetState(i, &state) == ERROR_SUCCESS &&
+                (state.Gamepad.wButtons & gRadioSwitchNextPad)) {
+                padDown = true;
+                break;
+            }
+        }
+    }
+    bool btnDown = keyDown || padDown;
+
+    static bool sBtnWasDown = false;
+    static DWORD sBtnDownTick = 0;
+    static bool sHoldFired = false;
+    const DWORD RADIO_OFF_HOLD_MS = 2500;
+
+    // While the pause menu / cutscene is up the radio is paused and must not change.
+    // GetAsyncKeyState / XInput read the physical device even then, so swallow all
+    // switch input here (the wheel bytes are already consumed above) and reset the
+    // hold tracker, so an in-menu press or a hold spanning the pause is not
+    // registered and does not fire a switch the moment the menu closes.
+    if (gRadioInputBlocked) {
+        sBtnWasDown = false;
+        sHoldFired = false;
+        return;
+    }
+
+    if (wheelUp)
+        gSwitchNext = true;
+    if (wheelDown)
+        gSwitchPrev = true;
+
+    if (btnDown && !sBtnWasDown) {          // press started
+        sBtnDownTick = GetTickCount();
+        sHoldFired = false;
+    }
+    else if (btnDown && sBtnWasDown) {      // still held
+        if (!sHoldFired && GetTickCount() - sBtnDownTick >= RADIO_OFF_HOLD_MS) {
+            gRadioOff = true;               // held long enough -> off (once)
+            sHoldFired = true;
+        }
+    }
+    else if (!btnDown && sBtnWasDown) {     // released
+        if (!sHoldFired)
+            gSwitchNext = true;             // it was a tap -> change station
+    }
+    sBtnWasDown = btnDown;
+}
+
 class SwitchDetectorPlugin
 {
 public:
@@ -381,64 +464,97 @@ public:
 
         Events::gameProcessEvent.Add([]()
             {
-                // Native radio pass-through toggle: lift the suppression patches
-                // only while the player is on foot inside an interior (clubs and
-                // shops play their ambient music through the patched functions);
-                // re-apply them everywhere else. Transitions are rare and happen
-                // on the main thread — the same thread that runs those functions.
-                bool allowNative = (CGame::currArea != 0) && !gPlayerInVehicle;
-                if (allowNative != gNativeAudioAllowed)
+                // Native radio pass-through toggle: lift the suppression patches for
+                // the WHOLE time the player is inside an interior — on foot or driving.
+                // Interiors play their own music/crowd audio through these functions,
+                // and a patched (no-op) function cannot STOP a sound the game already
+                // started. Re-patching when the player got into the event car inside the
+                // stadium therefore froze that audio mid-play, and the stadium music
+                // kept going after the event ended (until a pause re-synced audio).
+                //
+                // A settle window keeps them lifted briefly AFTER the interior is left:
+                // the native code has to run at least once with the new area to notice
+                // it should stop the interior music, so re-patching on the exact
+                // transition frame would strand the music playing all over again.
+                //
+                // This was tried once before and crashed at event exit — that crash was
+                // the DMAudio.SetRadioInCar(10) call in Main.cpp executing the real
+                // native setter during the game's teardown on that frame. That call is
+                // now gone, so lifting here is safe. The stock car radio still cannot
+                // come back while driving: the vehicle's station byte is pinned to 10
+                // (off) every frame in drawHudEvent, the radio key stays patched out,
+                // and the wheel bytes are consumed before native code can see them.
+                // Transitions are rare and happen on the main thread — the same thread
+                // that runs those functions.
+                // The player is in a vehicle, or has STARTED getting into one. Checked
+                // from the ped's task state, not just m_bInVehicle: that only turns true
+                // once the player is SEATED, about a second after the entry animation
+                // begins, and the game assigns the car its station inside that gap —
+                // long enough for the native side to LATCH its stock name banner (which
+                // is latched at retune, so pinning the station byte back to 10 a frame
+                // later cannot un-draw it). Read live from the ped rather than via
+                // gPlayerInVehicle, which is a frame stale depending on handler order.
+                CPlayerPed* pPed = FindPlayerPed();
+                bool vehicleBusy = gPlayerInVehicle;
+                if (pPed) {
+                    DWORD st = *(DWORD*)((BYTE*)pPed + 0x244);
+                    vehicleBusy = pPed->m_bInVehicle
+                        || st == 24   // SEEK_CAR
+                        || st == 50   // DRIVING
+                        || st == 51   // PASSENGER
+                        || st == 52   // TAXI_PASSNGR
+                        || st == 53   // OPEN_DOOR
+                        || st == 56   // CARJACK
+                        || st == 58   // ENTER_CAR
+                        || st == 59   // STEAL_CAR
+                        || st == 60;  // EXIT_CAR
+                }
+
+                // Native audio is allowed ONLY while the player is on foot inside an
+                // interior — never anywhere near a vehicle, so the native side can never
+                // latch a station banner. No timing window is involved any more.
+                //
+                // The reason a timed window was needed before: a patched (no-op)
+                // function cannot STOP a sound the game already started, so re-patching
+                // while interior music was playing froze it and it played forever.
+                // Fixed properly below by telling the game to stop it first.
+                bool allowNative = (CGame::currArea != 0) && !vehicleBusy;
+
+                if (allowNative != gNativeAudioAllowed) {
+                    if (!allowNative) {
+                        // About to re-apply the patches. VC plays interior/club/stadium
+                        // music THROUGH the radio system (that is why these patches
+                        // silence it), so ask the game to switch that radio off while
+                        // its setter is still live. The sound is then already stopped
+                        // when the no-op patch lands, instead of being frozen mid-play.
+                        // Deterministic — no settle window, and it covers every exit
+                        // (walking out, getting into the event car, or being placed
+                        // outside still sitting in a vehicle).
+                        //
+                        // Safe to call here, unlike the per-frame call this replaces:
+                        // that one also ran during the event-end teleport/teardown,
+                        // which is what crashed inside gta-vc.exe. By the time an event
+                        // ends the player is already in the event vehicle, so the
+                        // patches are applied and this transition has long since passed.
+                        const unsigned int RADIO_OFF = 10;
+                        DMAudio.SetRadioInCar(RADIO_OFF);
+                    }
                     ApplyRadioSuppression(!allowNative);
-
-                // Consume wheel bytes immediately so the native VC radio code path
-                // (which runs later in CGame::Process via DMAudio) never sees them.
-                if (*pMouseWheelUp) {
-                    gSwitchNext = true;
-                    *pMouseWheelUp = 0;
-                }
-                if (*pMouseWheelDown) {
-                    gSwitchPrev = true;
-                    *pMouseWheelDown = 0;
-                }
-
-                // Radio-switch button (keyboard key OR controller button): a quick
-                // TAP changes station; a HOLD of ~2.5s turns the radio OFF (same as
-                // scrolling past the last station). The switch fires on RELEASE so a
-                // tap and a hold can be told apart. (Mouse scroll above stays tap-only.)
-                bool keyDown = (GetAsyncKeyState(gRadioSwitchNextKey) & 0x8000) != 0;
-                bool padDown = false;
-                if (gRadioSwitchNextPad != 0) {
-                    for (DWORD i = 0; i < XUSER_MAX_COUNT; i++) {
-                        XINPUT_STATE state = {};
-                        if (XInputGetState(i, &state) == ERROR_SUCCESS &&
-                            (state.Gamepad.wButtons & gRadioSwitchNextPad)) {
-                            padDown = true;
-                            break;
-                        }
+                    if (gLog.is_open()) {
+                        gLog << "RadioHooks: native audio "
+                             << (allowNative ? "ALLOWED" : "suppressed (native radio switched off first)")
+                             << " (area " << CGame::currArea
+                             << ", vehicle " << (vehicleBusy ? 1 : 0) << ")" << std::endl;
+                        gLog.flush();
                     }
                 }
-                bool btnDown = keyDown || padDown;
 
-                static bool gBtnWasDown = false;
-                static DWORD gBtnDownTick = 0;
-                static bool gHoldFired = false;
-                const DWORD RADIO_OFF_HOLD_MS = 2500;
-
-                if (btnDown && !gBtnWasDown) {          // press started
-                    gBtnDownTick = GetTickCount();
-                    gHoldFired = false;
-                }
-                else if (btnDown && gBtnWasDown) {      // still held
-                    if (!gHoldFired && GetTickCount() - gBtnDownTick >= RADIO_OFF_HOLD_MS) {
-                        gRadioOff = true;               // held long enough -> off (once)
-                        gHoldFired = true;
-                    }
-                }
-                else if (!btnDown && gBtnWasDown) {     // released
-                    if (!gHoldFired)
-                        gSwitchNext = true;             // it was a tap -> change station
-                }
-                gBtnWasDown = btnDown;
+                // NOTE: radio-switch input polling (mouse wheel + key / pad, and the
+                // hold-to-off detection) now happens in PollRadioSwitchInput(), which
+                // Main.cpp calls at the TOP of its gameProcessEvent — the same frame it
+                // consumes the flags. That guarantees a scroll is detected and acted on
+                // in one frame regardless of handler order, so the on-screen station
+                // name no longer trails the wheel by a frame during a fast spin.
             });
     }
 } switchDetectorPlugin;
