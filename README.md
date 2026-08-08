@@ -4,6 +4,10 @@ Plugin for GTA VC that recreates the whole radio system from scratch, allowing y
 
 Current version: 1.2
 
+Contributors:
+- Captain Northstar
+- Alx1690
+
 CHANGELOG
 
 Version 1.2
