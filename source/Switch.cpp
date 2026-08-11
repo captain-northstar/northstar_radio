@@ -229,6 +229,68 @@ static BYTE gOrigSetRadioInCar[5];
 static BYTE gOrigRadioProcess[5];
 static bool gNativeAudioAllowed = false; // false = patches applied (suppressed)
 
+// ---- Executable verification -------------------------------------------------
+//
+// Every address this plugin patches is a GTA VC 1.0 US address (the build the
+// whole VC modding scene targets; gta-vc.exe is 3,088,896 bytes). Some copies in
+// circulation — repacks in particular — ship a DIFFERENT build of the game: same
+// game, but only about half the code in common and every function at a different
+// address. Blindly writing a JMP into such an executable corrupts whatever
+// instruction happens to live there, which is far worse than the plugin simply
+// not running. So each target's first bytes are checked before it is patched; on
+// a mismatch that patch is skipped and the reason is logged.
+//
+// IMPORTANT: a single site mismatching does NOT mean the wrong executable. Other
+// ASIs hook these functions too — CLEO patches the script dispatcher, so
+// ProcessOneCommand very often does not match by the time we load — and
+// safetyhook is perfectly able to hook on top of that. Refusing to patch on a
+// single mismatch broke script integration (and with it [STARTOFFSET], which
+// rides on the intro's 041E station change) on a normal, working install. So the
+// check is an AGGREGATE fingerprint: if ANY site still matches, this is the 1.0
+// US build and everything is patched as usual. Only when NOTHING matches do we
+// conclude it is a different build of the game and skip patching entirely.
+struct CodeSite { unsigned int addr; const char* name; BYTE expect[8]; size_t len; };
+
+static const CodeSite kSiteChangeStation = { 0x4AA590, "CPad::ChangeStationJustDown",
+                                             {0x53,0x89,0xCB,0x66,0x83,0xBB,0xF0,0x00}, 8 };
+static const CodeSite kSiteSetRadioInCar = { 0x5F9730, "cDMAudio::SetRadioInCar",
+                                             {0x83,0xEC,0x08,0x8B,0x44,0x24,0x0C,0x50}, 8 };
+static const CodeSite kSiteRadioProcess  = { 0x5FB600, "vehicle radio audio process",
+                                             {0x53,0x56,0x57,0x55,0x83,0xEC,0x08,0x89}, 8 };
+static const CodeSite kSiteProcessCommand= { 0x44FBE0, "CRunningScript::ProcessOneCommand",
+                                             {0x66,0xFF,0x05,0x66,0x0A,0xA1,0x00,0x8B}, 8 };
+// The 057D PLAY_ANNOUNCEMENT dispatch call, used only by the fallback below:
+//   6377E5  mov eax,[0x7D7438]   ; script parameter (0 or 1)
+//   6377EA  mov ecx,0xA10B8A     ; DMAudio instance (thiscall)
+//   6377EF  add eax,0x19         ; +25  -> 0 becomes 25, 1 becomes 26
+//   6377F3  call 0x5F9940        ; cDMAudio::PlayRadioAnnouncement
+static const CodeSite kSiteAnnounceCall  = { 0x6377F3, "057D PLAY_ANNOUNCEMENT call site",
+                                             {0xE8,0x48,0x21,0xFC,0xFF}, 5 };
+// Fingerprint-only (never patched, so mods do not disturb it):
+static const CodeSite kSiteAnnounceFn    = { 0x5F9940, "cDMAudio::PlayRadioAnnouncement",
+                                             {0x83,0xEC,0x08,0x8B,0x44,0x24,0x0C,0x50}, 8 };
+
+static bool VerifySite(const CodeSite& site)
+{
+    BYTE actual[8] = {};
+    injector::ReadMemoryRaw(site.addr, actual, site.len, true);
+    for (size_t i = 0; i < site.len; i++) {
+        if (actual[i] != site.expect[i])
+            return false;
+    }
+    return true;
+}
+
+// Startup status, recorded here (the constructor runs before gLog is open) and
+// written to the log from initGameEvent so a user's log always says what happened.
+static bool gExeVerified = false;         // aggregate: at least one site matched
+static int  gSitesMatched = 0;            // how many of the fingerprint sites matched
+static bool gSiteOkProcessCommand = false;
+static bool gSiteOkAnnounceCall = false;
+static bool gScmHookInstalled = false;
+static bool gAnnounceFallbackActive = false;
+static bool gAnnounceFallbackTried = false;
+
 extern bool gPlayerInVehicle;    // defined in Main.cpp; updated every frame
 extern bool gRadioInputBlocked;  // defined in Main.cpp; true while paused (menu/cutscene/load)
 
@@ -428,36 +490,134 @@ void PollRadioSwitchInput()
     sBtnWasDown = btnDown;
 }
 
+// ---- Announcement fallback ---------------------------------------------------
+//
+// Used only when the SCM mid-hook could not be installed. safetyhook has been
+// seen to FAIL SILENTLY on some custom/repacked executables in this project
+// before (that is what let the stock radio banner flash through in 1.0.1), and
+// when it fails at CRunningScript::ProcessOneCommand the plugin never sees opcode
+// 057D — so the bridge-closed / bridge-open announcements never play, with
+// nothing in the log to say why.
+//
+// This fallback replaces the game's own 057D dispatch call with a call to us,
+// which is a plain byte patch and therefore does not depend on safetyhook at all.
+// The native argument has already been translated by the game to 25 (bridge
+// closed) / 26 (bridge open) at that point, so it is mapped back to the 0 / 1 the
+// rest of the plugin expects. Any other value is handed to the original function
+// untouched. Announcements only: mission radio changes (041E) and audio ducking
+// (0394 / 03D1) still need the SCM hook, and their loss is reported in the log.
+typedef void(__thiscall* PlayRadioAnnouncementFn)(void* self, unsigned int announcement);
+
+static void __fastcall Hook_PlayRadioAnnouncement(void* self, void* edx, unsigned int announcement)
+{
+    if (announcement == 25) {        // bridge closed  -> BCLOSED.mp3
+        gPendingAnnouncement = 0;
+        return;
+    }
+    if (announcement == 26) {        // bridge open    -> BOPEN.mp3
+        gPendingAnnouncement = 1;
+        return;
+    }
+    // Not one of ours: let the game handle it exactly as before.
+    ((PlayRadioAnnouncementFn)0x5F9940)(self, announcement);
+}
+
 class SwitchDetectorPlugin
 {
 public:
     SwitchDetectorPlugin()
     {
-        injector::MakeJMP(0x4AA590, (void*)Hook_ChangeStationJustDown, true);
-        // Save the original prologues, then suppress the native radio. The saved
-        // bytes let gameProcessEvent lift the patches while the player is on foot
-        // in an interior (so interior ambient music plays) and re-apply on exit.
-        injector::ReadMemoryRaw(0x5F9730, gOrigSetRadioInCar, sizeof(gOrigSetRadioInCar), true);
-        injector::ReadMemoryRaw(0x5FB600, gOrigRadioProcess, sizeof(gOrigRadioProcess), true);
-        ApplyRadioSuppression(true);
+        // Fingerprint the executable. Individual sites may legitimately mismatch
+        // because another ASI patched them first (CLEO hooks the dispatcher), so
+        // only a TOTAL mismatch means a different build of the game.
+        gSiteOkProcessCommand = VerifySite(kSiteProcessCommand);
+        gSiteOkAnnounceCall = VerifySite(kSiteAnnounceCall);
+        const bool okChangeStation = VerifySite(kSiteChangeStation);
+        const bool okSetRadio = VerifySite(kSiteSetRadioInCar);
+        const bool okRadioProcess = VerifySite(kSiteRadioProcess);
+        const bool okAnnounceFn = VerifySite(kSiteAnnounceFn);
+
+        gSitesMatched = (okChangeStation ? 1 : 0) + (okSetRadio ? 1 : 0)
+                      + (okRadioProcess ? 1 : 0) + (gSiteOkProcessCommand ? 1 : 0)
+                      + (gSiteOkAnnounceCall ? 1 : 0) + (okAnnounceFn ? 1 : 0);
+        gExeVerified = (gSitesMatched > 0);
+
+        if (gExeVerified) {
+            injector::MakeJMP(kSiteChangeStation.addr, (void*)Hook_ChangeStationJustDown, true);
+            // Save the original prologues, then suppress the native radio. The saved
+            // bytes let gameProcessEvent lift the patches while the player is on foot
+            // in an interior (so interior ambient music plays) and re-apply on exit.
+            injector::ReadMemoryRaw(0x5F9730, gOrigSetRadioInCar, sizeof(gOrigSetRadioInCar), true);
+            injector::ReadMemoryRaw(0x5FB600, gOrigRadioProcess, sizeof(gOrigRadioProcess), true);
+            ApplyRadioSuppression(true);
+        }
 
         // Watch the SCM dispatcher for opcodes 057D (announcements),
         // 041E (mission radio-station changes), 0394/03D1 (audio ducking).
         // Skipped entirely when ScriptIntegration is disabled (total conversions
         // with an incompatible custom main.scm) — the core radio still runs.
+        //
+        // Always ATTEMPT the hook: safetyhook can hook a function another mod has
+        // already patched, and the byte check above is only a fingerprint. The
+        // fallback is driven by whether the hook really installed, nothing else.
         gScriptIntegrationEnabled = ReadScriptIntegrationFlag();
-        if (gScriptIntegrationEnabled)
+        if (gScriptIntegrationEnabled && gExeVerified) {
             gScmHook = safetyhook::create_mid((void*)0x44FBE0, OnProcessOneCommand);
+            gScmHookInstalled = static_cast<bool>(gScmHook);
+
+            // Hook genuinely failed to install (this has happened silently on some
+            // custom executables): keep the announcements alive with a plain byte
+            // patch of the game's own 057D dispatch call instead.
+            if (!gScmHookInstalled) {
+                gAnnounceFallbackTried = true;
+                if (gSiteOkAnnounceCall) {
+                    injector::MakeCALL(kSiteAnnounceCall.addr, (void*)Hook_PlayRadioAnnouncement, true);
+                    gAnnounceFallbackActive = true;
+                }
+            }
+        }
 
         Events::initGameEvent.Add([]()
             {
                 LoadControlsFromINI();
                 if (gLog.is_open()) {
+                    // Executable fingerprint. Fewer than 6 matches is normal — it
+                    // just means another ASI hooked that function before us.
+                    if (!gExeVerified) {
+                        gLog << "RadioHooks: *** UNEXPECTED EXECUTABLE *** none of the 6 known code"
+                                " sites matched — ALL patches skipped to avoid corrupting the game."
+                             << std::endl;
+                        gLog << "RadioHooks: this plugin targets GTA VC 1.0 US (gta-vc.exe 3,088,896"
+                                " bytes). A repack shipping a different build will not work."
+                             << std::endl;
+                    }
+                    else {
+                        gLog << "RadioHooks: byte-patch suppression active (lifted on foot in interiors)"
+                             << "  [exe fingerprint " << gSitesMatched << "/6"
+                             << (gSitesMatched < 6 ? ", rest already hooked by other mods]" : "]")
+                             << std::endl;
+                    }
+
                     gLog << "ScriptIntegration (announcements / mission-radio / ducking): "
                          << (gScriptIntegrationEnabled ? "ENABLED"
-                                                       : "DISABLED (SCM hook not installed)")
+                                                       : "DISABLED by INI (SCM hook not installed)")
                          << std::endl;
-                    gLog << "RadioHooks: byte-patch suppression active (lifted on foot in interiors)" << std::endl;
+
+                    if (gScriptIntegrationEnabled) {
+                        if (gScmHookInstalled) {
+                            gLog << "ScriptIntegration: SCM hook installed OK" << std::endl;
+                        }
+                        else {
+                            gLog << "ScriptIntegration: SCM hook FAILED to install "
+                                    "(safetyhook could not patch this exe)" << std::endl;
+                            if (gAnnounceFallbackActive)
+                                gLog << "ScriptIntegration: announcement FALLBACK active (bridge bulletins will play; "
+                                        "mission-radio changes and audio ducking are NOT available)" << std::endl;
+                            else if (gAnnounceFallbackTried)
+                                gLog << "ScriptIntegration: announcement fallback unavailable too "
+                                        "(057D call site does not match) — no announcements on this exe" << std::endl;
+                        }
+                    }
                     gLog.flush();
                 }
             });
@@ -486,6 +646,11 @@ public:
                 // and the wheel bytes are consumed before native code can see them.
                 // Transitions are rare and happen on the main thread — the same thread
                 // that runs those functions.
+                // Suppression was never installed (unexpected executable): there is
+                // nothing to toggle, and the saved original bytes are not valid.
+                if (!gExeVerified)
+                    return;
+
                 // The player is in a vehicle, or has STARTED getting into one. Checked
                 // from the ped's task state, not just m_bInVehicle: that only turns true
                 // once the player is SEATED, about a second after the entry animation
