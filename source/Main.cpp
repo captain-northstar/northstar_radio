@@ -1152,6 +1152,59 @@ public:
                 }
 
                 if (inVehicle && pVehicle && !playerExiting && pVehicle->IsLawEnforcementVehicle()) {
+                    // Story bulletins play in police vehicles too, exactly like the
+                    // original game: the announcement interrupts the scanner chatter
+                    // and the scanner resumes when it finishes. (The original stores
+                    // the announcement in a pending slot in cAudioManager and plays it
+                    // independently of what the car's radio is doing, so being in a
+                    // cop car does not swallow it.) This block runs before the scanner
+                    // is (re)started below, and returns, so the two never fight over
+                    // gStream.
+                    {
+                        int req = gPendingAnnouncement.exchange(-1);
+                        if (req == 0 || req == 1)
+                            gQueuedAnnouncement = req;
+                    }
+
+                    if (gAnnouncementPlaying) {
+                        if (!gStream || BASS_ChannelIsActive(gStream) == BASS_ACTIVE_STOPPED) {
+                            StopRadio();
+                            gAnnouncementPlaying = false;
+                            gPoliceRadioPlaying = false;  // scanner restarts next frame
+                            gLog << "Announcement finished, resuming police radio" << std::endl;
+                            gLog.flush();
+                        }
+                        UpdateVolume();
+                        return;
+                    }
+
+                    if (gQueuedAnnouncement != -1) {
+                        int ann = gQueuedAnnouncement;
+                        gQueuedAnnouncement = -1;
+                        std::string annFile = gGameFolder + "audio\\" + (ann == 0 ? "BCLOSED.mp3" : "BOPEN.mp3");
+
+                        StopRadio();          // stop the scanner for the bulletin
+                        StopStaticSound();
+                        gStream = BASS_StreamCreateFile(FALSE, annFile.c_str(), 0, 0, 0);
+                        if (gStream) {
+                            unsigned char vol = *pMusicVolume;
+                            gLastVolume = vol;
+                            BASS_ChannelSetAttribute(gStream, BASS_ATTRIB_VOL, RadioVolume(vol));
+                            BASS_ChannelPlay(gStream, FALSE);
+                            gAnnouncementPlaying = true;
+                            gPoliceRadioPlaying = false;  // restarted once this finishes
+                            gStationNameToShow = "";
+                            gLog << "Announcement playing (police vehicle): " << annFile << std::endl;
+                            gLog.flush();
+                            UpdateVolume();
+                            return;
+                        }
+                        gLog << "Announcement: BASS error " << BASS_ErrorGetCode()
+                             << " (" << annFile << ")" << std::endl;
+                        gLog.flush();
+                        // Fall through: no bulletin, just run the scanner.
+                    }
+
                     if (!gPoliceRadioPlaying) {
                         StopRadio();
                         StopStaticSound();
