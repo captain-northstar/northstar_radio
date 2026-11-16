@@ -49,6 +49,13 @@ std::atomic<int> gPendingScmStationTime{ -1 };
 // "mission passed" tune (opcode 0394); gDialogueDuckUntil is refreshed by each
 // mission dialogue line (opcode 03D1 PLAY_MISSION_AUDIO).
 std::atomic<DWORD> gMissionPassedDuckUntil{ 0 };
+
+// Set when the script fires 0394 PLAY_MISSION_PASSED_TUNE. The jingle is stream
+// 9 (AUDIO\MISCOM.MP3) and the game plays it itself, even with the suppression
+// patches in place. Main.cpp uses this flag only to WATCH the music manager for a
+// few seconds and log whether a MISCOM slot actually started (diagnostics for a missed
+// jingle that was reported once and never reproduced).
+std::atomic<bool> gMissionPassedTune{ false };
 std::atomic<DWORD> gDialogueDuckUntil{ 0 };
 
 // CPad::NewMouseControllerState.wheelUp / .wheelDown  (current-frame mouse state).
@@ -228,6 +235,97 @@ static bool __fastcall Hook_ChangeStationJustDown(CPad* self, void* edx)
 static BYTE gOrigSetRadioInCar[5];
 static BYTE gOrigRadioProcess[5];
 static bool gNativeAudioAllowed = false; // false = patches applied (suppressed)
+static int  gNativeArea = 0;             // the area the native code was last let through in
+
+// ---- Interiors with their own music (2026-10-20) --------------------------------------------------------------------
+// User: in the hotring event the announcer played but not the event's music, which then played outside after the event.
+// 0x5FB600 is cMusicManager::ServiceGameMode. Its area table (0x6CDB44) keeps the CAR RADIO OFF in the hotel (1), the
+// mall (4), the strip club (5), the stadium events (14 dirt ring, 15 bloodring, 16 hotring) and Malibu (17) and plays the
+// room's own track instead (stream ids 16 MALLAMB, 17 STRIP, 18 MALIBU, 19 HOTEL, 20 DIRTRING). The stadium events seat
+// the player in a car, so "native only on foot in interiors" silenced their music. In these areas the native code is let
+// through in a vehicle too - it never runs the car radio there, so no stock station and no banner.
+static bool AreaHasOwnMusic(int area)
+{
+    return area == 1 || area == 4 || area == 5 || (area >= 14 && area <= 17);
+}
+
+// cMusicManager (0x980038): +0x3988 = the track playing, +0x398D = the music mode now (1 game, 4 disabled). A no-op
+// ServiceGameMode cannot stop a track it started, so re-patching while an interior's music played left it playing
+// outside (until a pause - the pause menu's music-mode change stops it). The same is done here: cDMAudio::ChangeMusicMode
+// (0x5F98B0) to "disabled" makes cMusicManager::Service (never patched) stop the stream and forget the track, then back
+// to game music. No vehicle is touched (the stadium exit is a teleport out of the event car - DMAudio.SetRadioInCar once
+// crashed there).
+static const uintptr_t kMusicPlayingTrack = 0x980038 + 0x3988;
+static const uintptr_t kMusicModeNow      = 0x980038 + 0x398D;
+static int   gMusicCycle = 0;     // 1 = waiting for the music manager to reach "disabled"
+static DWORD gMusicCycleTick = 0;
+
+static void ChangeMusicMode(unsigned char mode)
+{
+    plugin::CallMethod<0x5F98B0, cDMAudio*, unsigned char>(&DMAudio, mode);
+}
+
+// ---- Executable verification -------------------------------------------------
+//
+// Every address this plugin patches is a GTA VC 1.0 US address (the build the
+// whole VC modding scene targets; gta-vc.exe is 3,088,896 bytes). Some copies in
+// circulation — repacks in particular — ship a DIFFERENT build of the game: same
+// game, but only about half the code in common and every function at a different
+// address. Blindly writing a JMP into such an executable corrupts whatever
+// instruction happens to live there, which is far worse than the plugin simply
+// not running. So each target's first bytes are checked before it is patched; on
+// a mismatch that patch is skipped and the reason is logged.
+//
+// IMPORTANT: a single site mismatching does NOT mean the wrong executable. Other
+// ASIs hook these functions too — CLEO patches the script dispatcher, so
+// ProcessOneCommand very often does not match by the time we load — and
+// safetyhook is perfectly able to hook on top of that. Refusing to patch on a
+// single mismatch broke script integration (and with it [STARTOFFSET], which
+// rides on the intro's 041E station change) on a normal, working install. So the
+// check is an AGGREGATE fingerprint: if ANY site still matches, this is the 1.0
+// US build and everything is patched as usual. Only when NOTHING matches do we
+// conclude it is a different build of the game and skip patching entirely.
+struct CodeSite { unsigned int addr; const char* name; BYTE expect[8]; size_t len; };
+
+static const CodeSite kSiteChangeStation = { 0x4AA590, "CPad::ChangeStationJustDown",
+                                             {0x53,0x89,0xCB,0x66,0x83,0xBB,0xF0,0x00}, 8 };
+static const CodeSite kSiteSetRadioInCar = { 0x5F9730, "cDMAudio::SetRadioInCar",
+                                             {0x83,0xEC,0x08,0x8B,0x44,0x24,0x0C,0x50}, 8 };
+static const CodeSite kSiteRadioProcess  = { 0x5FB600, "vehicle radio audio process",
+                                             {0x53,0x56,0x57,0x55,0x83,0xEC,0x08,0x89}, 8 };
+static const CodeSite kSiteProcessCommand= { 0x44FBE0, "CRunningScript::ProcessOneCommand",
+                                             {0x66,0xFF,0x05,0x66,0x0A,0xA1,0x00,0x8B}, 8 };
+// The 057D PLAY_ANNOUNCEMENT dispatch call, used only by the fallback below:
+//   6377E5  mov eax,[0x7D7438]   ; script parameter (0 or 1)
+//   6377EA  mov ecx,0xA10B8A     ; DMAudio instance (thiscall)
+//   6377EF  add eax,0x19         ; +25  -> 0 becomes 25, 1 becomes 26
+//   6377F3  call 0x5F9940        ; cDMAudio::PlayRadioAnnouncement
+static const CodeSite kSiteAnnounceCall  = { 0x6377F3, "057D PLAY_ANNOUNCEMENT call site",
+                                             {0xE8,0x48,0x21,0xFC,0xFF}, 5 };
+// Fingerprint-only (never patched, so mods do not disturb it):
+static const CodeSite kSiteAnnounceFn    = { 0x5F9940, "cDMAudio::PlayRadioAnnouncement",
+                                             {0x83,0xEC,0x08,0x8B,0x44,0x24,0x0C,0x50}, 8 };
+
+static bool VerifySite(const CodeSite& site)
+{
+    BYTE actual[8] = {};
+    injector::ReadMemoryRaw(site.addr, actual, site.len, true);
+    for (size_t i = 0; i < site.len; i++) {
+        if (actual[i] != site.expect[i])
+            return false;
+    }
+    return true;
+}
+
+// Startup status, recorded here (the constructor runs before gLog is open) and
+// written to the log from initGameEvent so a user's log always says what happened.
+static bool gExeVerified = false;         // aggregate: at least one site matched
+static int  gSitesMatched = 0;            // how many of the fingerprint sites matched
+static bool gSiteOkProcessCommand = false;
+static bool gSiteOkAnnounceCall = false;
+static bool gScmHookInstalled = false;
+static bool gAnnounceFallbackActive = false;
+static bool gAnnounceFallbackTried = false;
 
 extern bool gPlayerInVehicle;    // defined in Main.cpp; updated every frame
 extern bool gRadioInputBlocked;  // defined in Main.cpp; true while paused (menu/cutscene/load)
@@ -320,6 +418,14 @@ static void OnProcessOneCommand(SafetyHookContext& ctx)
 
     if (op == 0x0394) {          // PLAY_MISSION_PASSED_TUNE -> duck the radio for the jingle
         gMissionPassedDuckUntil = GetTickCount() + 5000;
+        gMissionPassedTune = true;   // Main.cpp watches whether the game plays the tune
+        if (gLog.is_open()) {
+            gLog << "SCM 0394: mission passed (native audio "
+                 << (gNativeAudioAllowed ? "ALLOWED" : "suppressed")
+                 << "; music track " << *(int*)(0x980038 + 0x3988)
+                 << " mode " << (int)*(unsigned char*)(0x980038 + 0x398D) << ")" << std::endl;
+            gLog.flush();
+        }
         return;
     }
 
@@ -428,36 +534,134 @@ void PollRadioSwitchInput()
     sBtnWasDown = btnDown;
 }
 
+// ---- Announcement fallback ---------------------------------------------------
+//
+// Used only when the SCM mid-hook could not be installed. safetyhook has been
+// seen to FAIL SILENTLY on some custom/repacked executables in this project
+// before (that is what let the stock radio banner flash through in 1.0.1), and
+// when it fails at CRunningScript::ProcessOneCommand the plugin never sees opcode
+// 057D — so the bridge-closed / bridge-open announcements never play, with
+// nothing in the log to say why.
+//
+// This fallback replaces the game's own 057D dispatch call with a call to us,
+// which is a plain byte patch and therefore does not depend on safetyhook at all.
+// The native argument has already been translated by the game to 25 (bridge
+// closed) / 26 (bridge open) at that point, so it is mapped back to the 0 / 1 the
+// rest of the plugin expects. Any other value is handed to the original function
+// untouched. Announcements only: mission radio changes (041E) and audio ducking
+// (0394 / 03D1) still need the SCM hook, and their loss is reported in the log.
+typedef void(__thiscall* PlayRadioAnnouncementFn)(void* self, unsigned int announcement);
+
+static void __fastcall Hook_PlayRadioAnnouncement(void* self, void* edx, unsigned int announcement)
+{
+    if (announcement == 25) {        // bridge closed  -> BCLOSED.mp3
+        gPendingAnnouncement = 0;
+        return;
+    }
+    if (announcement == 26) {        // bridge open    -> BOPEN.mp3
+        gPendingAnnouncement = 1;
+        return;
+    }
+    // Not one of ours: let the game handle it exactly as before.
+    ((PlayRadioAnnouncementFn)0x5F9940)(self, announcement);
+}
+
 class SwitchDetectorPlugin
 {
 public:
     SwitchDetectorPlugin()
     {
-        injector::MakeJMP(0x4AA590, (void*)Hook_ChangeStationJustDown, true);
-        // Save the original prologues, then suppress the native radio. The saved
-        // bytes let gameProcessEvent lift the patches while the player is on foot
-        // in an interior (so interior ambient music plays) and re-apply on exit.
-        injector::ReadMemoryRaw(0x5F9730, gOrigSetRadioInCar, sizeof(gOrigSetRadioInCar), true);
-        injector::ReadMemoryRaw(0x5FB600, gOrigRadioProcess, sizeof(gOrigRadioProcess), true);
-        ApplyRadioSuppression(true);
+        // Fingerprint the executable. Individual sites may legitimately mismatch
+        // because another ASI patched them first (CLEO hooks the dispatcher), so
+        // only a TOTAL mismatch means a different build of the game.
+        gSiteOkProcessCommand = VerifySite(kSiteProcessCommand);
+        gSiteOkAnnounceCall = VerifySite(kSiteAnnounceCall);
+        const bool okChangeStation = VerifySite(kSiteChangeStation);
+        const bool okSetRadio = VerifySite(kSiteSetRadioInCar);
+        const bool okRadioProcess = VerifySite(kSiteRadioProcess);
+        const bool okAnnounceFn = VerifySite(kSiteAnnounceFn);
+
+        gSitesMatched = (okChangeStation ? 1 : 0) + (okSetRadio ? 1 : 0)
+                      + (okRadioProcess ? 1 : 0) + (gSiteOkProcessCommand ? 1 : 0)
+                      + (gSiteOkAnnounceCall ? 1 : 0) + (okAnnounceFn ? 1 : 0);
+        gExeVerified = (gSitesMatched > 0);
+
+        if (gExeVerified) {
+            injector::MakeJMP(kSiteChangeStation.addr, (void*)Hook_ChangeStationJustDown, true);
+            // Save the original prologues, then suppress the native radio. The saved
+            // bytes let gameProcessEvent lift the patches while the player is on foot
+            // in an interior (so interior ambient music plays) and re-apply on exit.
+            injector::ReadMemoryRaw(0x5F9730, gOrigSetRadioInCar, sizeof(gOrigSetRadioInCar), true);
+            injector::ReadMemoryRaw(0x5FB600, gOrigRadioProcess, sizeof(gOrigRadioProcess), true);
+            ApplyRadioSuppression(true);
+        }
 
         // Watch the SCM dispatcher for opcodes 057D (announcements),
         // 041E (mission radio-station changes), 0394/03D1 (audio ducking).
         // Skipped entirely when ScriptIntegration is disabled (total conversions
         // with an incompatible custom main.scm) — the core radio still runs.
+        //
+        // Always ATTEMPT the hook: safetyhook can hook a function another mod has
+        // already patched, and the byte check above is only a fingerprint. The
+        // fallback is driven by whether the hook really installed, nothing else.
         gScriptIntegrationEnabled = ReadScriptIntegrationFlag();
-        if (gScriptIntegrationEnabled)
+        if (gScriptIntegrationEnabled && gExeVerified) {
             gScmHook = safetyhook::create_mid((void*)0x44FBE0, OnProcessOneCommand);
+            gScmHookInstalled = static_cast<bool>(gScmHook);
+
+            // Hook genuinely failed to install (this has happened silently on some
+            // custom executables): keep the announcements alive with a plain byte
+            // patch of the game's own 057D dispatch call instead.
+            if (!gScmHookInstalled) {
+                gAnnounceFallbackTried = true;
+                if (gSiteOkAnnounceCall) {
+                    injector::MakeCALL(kSiteAnnounceCall.addr, (void*)Hook_PlayRadioAnnouncement, true);
+                    gAnnounceFallbackActive = true;
+                }
+            }
+        }
 
         Events::initGameEvent.Add([]()
             {
                 LoadControlsFromINI();
                 if (gLog.is_open()) {
+                    // Executable fingerprint. Fewer than 6 matches is normal — it
+                    // just means another ASI hooked that function before us.
+                    if (!gExeVerified) {
+                        gLog << "RadioHooks: *** UNEXPECTED EXECUTABLE *** none of the 6 known code"
+                                " sites matched — ALL patches skipped to avoid corrupting the game."
+                             << std::endl;
+                        gLog << "RadioHooks: this plugin targets GTA VC 1.0 US (gta-vc.exe 3,088,896"
+                                " bytes). A repack shipping a different build will not work."
+                             << std::endl;
+                    }
+                    else {
+                        gLog << "RadioHooks: byte-patch suppression active (lifted on foot in interiors)"
+                             << "  [exe fingerprint " << gSitesMatched << "/6"
+                             << (gSitesMatched < 6 ? ", rest already hooked by other mods]" : "]")
+                             << std::endl;
+                    }
+
                     gLog << "ScriptIntegration (announcements / mission-radio / ducking): "
                          << (gScriptIntegrationEnabled ? "ENABLED"
-                                                       : "DISABLED (SCM hook not installed)")
+                                                       : "DISABLED by INI (SCM hook not installed)")
                          << std::endl;
-                    gLog << "RadioHooks: byte-patch suppression active (lifted on foot in interiors)" << std::endl;
+
+                    if (gScriptIntegrationEnabled) {
+                        if (gScmHookInstalled) {
+                            gLog << "ScriptIntegration: SCM hook installed OK" << std::endl;
+                        }
+                        else {
+                            gLog << "ScriptIntegration: SCM hook FAILED to install "
+                                    "(safetyhook could not patch this exe)" << std::endl;
+                            if (gAnnounceFallbackActive)
+                                gLog << "ScriptIntegration: announcement FALLBACK active (bridge bulletins will play; "
+                                        "mission-radio changes and audio ducking are NOT available)" << std::endl;
+                            else if (gAnnounceFallbackTried)
+                                gLog << "ScriptIntegration: announcement fallback unavailable too "
+                                        "(057D call site does not match) — no announcements on this exe" << std::endl;
+                        }
+                    }
                     gLog.flush();
                 }
             });
@@ -486,6 +690,11 @@ public:
                 // and the wheel bytes are consumed before native code can see them.
                 // Transitions are rare and happen on the main thread — the same thread
                 // that runs those functions.
+                // Suppression was never installed (unexpected executable): there is
+                // nothing to toggle, and the saved original bytes are not valid.
+                if (!gExeVerified)
+                    return;
+
                 // The player is in a vehicle, or has STARTED getting into one. Checked
                 // from the ped's task state, not just m_bInVehicle: that only turns true
                 // once the player is SEATED, about a second after the entry animation
@@ -518,10 +727,23 @@ public:
                 // function cannot STOP a sound the game already started, so re-patching
                 // while interior music was playing froze it and it played forever.
                 // Fixed properly below by telling the game to stop it first.
-                bool allowNative = (CGame::currArea != 0) && !vehicleBusy;
+                bool allowNative = (CGame::currArea != 0) && (!vehicleBusy || AreaHasOwnMusic(CGame::currArea));
 
                 if (allowNative != gNativeAudioAllowed) {
-                    if (!allowNative) {
+                    int playing = *(int*)kMusicPlayingTrack;
+                    bool roomMusic = playing >= 16 && playing <= 20;
+                    if (!allowNative && (roomMusic || AreaHasOwnMusic(gNativeArea))) {
+                        // Leaving a room with its own music: stop it with a music-mode change (see ChangeMusicMode) -
+                        // and not with SetRadioInCar, which the car radio never needed in these rooms.
+                        if (roomMusic) {
+                            ChangeMusicMode(3);
+                            gMusicCycle = 1;
+                            gMusicCycleTick = GetTickCount();
+                            if (gLog.is_open())
+                                gLog << "RadioHooks: room music (track " << playing << ") stopped on leaving area " << gNativeArea << std::endl;
+                        }
+                    }
+                    else if (!allowNative) {
                         // About to re-apply the patches. VC plays interior/club/stadium
                         // music THROUGH the radio system (that is why these patches
                         // silence it), so ask the game to switch that radio off while
@@ -533,19 +755,36 @@ public:
                         //
                         // Safe to call here, unlike the per-frame call this replaces:
                         // that one also ran during the event-end teleport/teardown,
-                        // which is what crashed inside gta-vc.exe. By the time an event
-                        // ends the player is already in the event vehicle, so the
-                        // patches are applied and this transition has long since passed.
+                        // which is what crashed inside gta-vc.exe. (Rooms with their own
+                        // music - the stadium events included, which are now let through
+                        // in the event car - take the branch above instead, so this never
+                        // runs on the event-end teleport.)
                         const unsigned int RADIO_OFF = 10;
                         DMAudio.SetRadioInCar(RADIO_OFF);
                     }
                     ApplyRadioSuppression(!allowNative);
+                    if (allowNative) gNativeArea = CGame::currArea;
                     if (gLog.is_open()) {
                         gLog << "RadioHooks: native audio "
                              << (allowNative ? "ALLOWED" : "suppressed (native radio switched off first)")
                              << " (area " << CGame::currArea
                              << ", vehicle " << (vehicleBusy ? 1 : 0) << ")" << std::endl;
                         gLog.flush();
+                    }
+                }
+
+                if (allowNative && CGame::currArea != gNativeArea) gNativeArea = CGame::currArea;
+
+                // The music-mode change above: once the stream is stopped, back to game music (the pause menu makes
+                // its own mode change - nothing left to do then).
+                if (gMusicCycle) {
+                    unsigned char modeNow = *(unsigned char*)kMusicModeNow;
+                    if (gRadioInputBlocked && modeNow != 4) gMusicCycle = 0;
+                    else if (modeNow == 4 || GetTickCount() - gMusicCycleTick > 3000) {
+                        ChangeMusicMode(1);
+                        gMusicCycle = 0;
+                        if (gLog.is_open())
+                            gLog << "RadioHooks: game music mode back" << (modeNow == 4 ? "" : " (timeout)") << std::endl;
                     }
                 }
 

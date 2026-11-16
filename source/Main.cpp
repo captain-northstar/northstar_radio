@@ -244,6 +244,20 @@ static bool gNoRadioVehicle = false;
 // SFX
 static HSTREAM gSfxTuningStream = 0;
 static HSTREAM gSfxStaticStream = 0;
+
+// The "mission passed" jingle (AUDIO\MISCOM.MP3, stream slots 9 / 99-102). The GAME
+// plays it — even while the suppression patches are in place (verified: with
+// native audio suppressed and the radio off, the game's own jingle still
+// sounded, so playing it from the plugin as well doubled it). The plugin only
+// ducks the radio under it. A user once reported not hearing it, which could not
+// be reproduced, so after each 0394 the music manager is WATCHED for a moment
+// and the log records whether the game actually started a MISCOM slot — if the miss
+// ever recurs, NorthstarRadio.log says what the music manager was doing.
+extern std::atomic<bool> gMissionPassedTune;  // set by the SCM hook on opcode 0394
+static DWORD gTuneWatchUntil = 0;             // 0 = not watching
+static int   gTuneWatchTrack = -1;            // last logged music track
+static int   gTuneWatchMode = -1;             // last logged music mode
+static bool  gTuneWatchSawMiscom = false;     // the game started a MISCOM slot
 static bool gSfxLoaded = false;
 
 // SDT entry structure — GTA VC PC: 20 bytes each
@@ -390,6 +404,7 @@ static void StopStaticSound()
     }
 }
 
+
 static void TurnRadioOff()
 {
     if (gStream) {
@@ -432,6 +447,8 @@ static void StopAndResetRadio()
         std::lock_guard<std::mutex> lock(gLoadMutex);
         gLoadedBuffer.clear();
     }
+    gMissionPassedTune = false;
+    gTuneWatchUntil = 0;
     gBufferReady = false;
     gWaitingToPlay = false;
     gWasInVehicle = false;
@@ -1087,6 +1104,46 @@ public:
                 }
                 if (isPaused) return;
 
+                // ===== "Mission passed" jingle (SCM opcode 0394): watch, don't play =====
+                // The game plays the jingle itself (MISCOM.MP3, slots 9 / 99-102) even
+                // with the suppression patches in place — playing it from the plugin
+                // too doubled it. So the plugin only ducks the radio, and for a few
+                // seconds after 0394 it logs the music manager's track/mode on every
+                // change, then whether a MISCOM slot started. A missed jingle (reported
+                // once, never reproduced) would then show up in the log with the music
+                // manager's state at the time, instead of being a guess. Placed before
+                // the early-returning vehicle branches so it runs in every situation.
+                if (gMissionPassedTune.exchange(false)) {
+                    gTuneWatchUntil = GetTickCount() + 3000;
+                    gTuneWatchTrack = -1;
+                    gTuneWatchMode = -1;
+                    gTuneWatchSawMiscom = false;
+                }
+                if (gTuneWatchUntil) {
+                    int track = *(int*)(0x980038 + 0x3988);           // cMusicManager playing track
+                    int mode = *(unsigned char*)(0x980038 + 0x398D);   // music mode (1 = game, 0 = frontend)
+                    // Stream slots 9 AND 99-102 all point at AUDIO\MISCOM.MP3 (the
+                    // game's mission-complete variants); a normal mission pass was seen
+                    // playing slot 101 in frontend mode (0). Checking slot 9 alone
+                    // reported a tune that played fine as missing.
+                    if (track == 9 || (track >= 99 && track <= 102))
+                        gTuneWatchSawMiscom = true;
+                    if (track != gTuneWatchTrack || mode != gTuneWatchMode) {
+                        gLog << "Mission passed watch: music track " << track
+                             << " mode " << mode << std::endl;
+                        gTuneWatchTrack = track;
+                        gTuneWatchMode = mode;
+                    }
+                    if (GetTickCount() > gTuneWatchUntil) {
+                        gLog << (gTuneWatchSawMiscom
+                                 ? "Mission passed watch: game played the tune (MISCOM)"
+                                 : "Mission passed watch: *** game did NOT start the tune (no MISCOM track seen) ***")
+                             << std::endl;
+                        gTuneWatchUntil = 0;
+                    }
+                    gLog.flush();
+                }
+
                 CVehicle* pVehicle = pPlayer->m_pVehicle;
                 bool inVehicle = pPlayer->m_bInVehicle;
                 gPlayerInVehicle = inVehicle;
@@ -1152,6 +1209,59 @@ public:
                 }
 
                 if (inVehicle && pVehicle && !playerExiting && pVehicle->IsLawEnforcementVehicle()) {
+                    // Story bulletins play in police vehicles too, exactly like the
+                    // original game: the announcement interrupts the scanner chatter
+                    // and the scanner resumes when it finishes. (The original stores
+                    // the announcement in a pending slot in cAudioManager and plays it
+                    // independently of what the car's radio is doing, so being in a
+                    // cop car does not swallow it.) This block runs before the scanner
+                    // is (re)started below, and returns, so the two never fight over
+                    // gStream.
+                    {
+                        int req = gPendingAnnouncement.exchange(-1);
+                        if (req == 0 || req == 1)
+                            gQueuedAnnouncement = req;
+                    }
+
+                    if (gAnnouncementPlaying) {
+                        if (!gStream || BASS_ChannelIsActive(gStream) == BASS_ACTIVE_STOPPED) {
+                            StopRadio();
+                            gAnnouncementPlaying = false;
+                            gPoliceRadioPlaying = false;  // scanner restarts next frame
+                            gLog << "Announcement finished, resuming police radio" << std::endl;
+                            gLog.flush();
+                        }
+                        UpdateVolume();
+                        return;
+                    }
+
+                    if (gQueuedAnnouncement != -1) {
+                        int ann = gQueuedAnnouncement;
+                        gQueuedAnnouncement = -1;
+                        std::string annFile = gGameFolder + "audio\\" + (ann == 0 ? "BCLOSED.mp3" : "BOPEN.mp3");
+
+                        StopRadio();          // stop the scanner for the bulletin
+                        StopStaticSound();
+                        gStream = BASS_StreamCreateFile(FALSE, annFile.c_str(), 0, 0, 0);
+                        if (gStream) {
+                            unsigned char vol = *pMusicVolume;
+                            gLastVolume = vol;
+                            BASS_ChannelSetAttribute(gStream, BASS_ATTRIB_VOL, RadioVolume(vol));
+                            BASS_ChannelPlay(gStream, FALSE);
+                            gAnnouncementPlaying = true;
+                            gPoliceRadioPlaying = false;  // restarted once this finishes
+                            gStationNameToShow = "";
+                            gLog << "Announcement playing (police vehicle): " << annFile << std::endl;
+                            gLog.flush();
+                            UpdateVolume();
+                            return;
+                        }
+                        gLog << "Announcement: BASS error " << BASS_ErrorGetCode()
+                             << " (" << annFile << ")" << std::endl;
+                        gLog.flush();
+                        // Fall through: no bulletin, just run the scanner.
+                    }
+
                     if (!gPoliceRadioPlaying) {
                         StopRadio();
                         StopStaticSound();

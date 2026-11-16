@@ -2,13 +2,19 @@ NORTHSTAR RADIO
 
 Plugin for GTA VC that recreates the whole radio system from scratch, allowing you to add infinite amount of new radio stations, assign new default stations to vehicles and play ambient radio from traffic. Created with AI (Claude).
 
-Current version: 1.2
+Current version: 1.3
 
 Contributors:
 - Captain Northstar
 - Alx1690
 
 CHANGELOG
+
+Version 1.3
+- Interiors that play their own music (the hotel, mall, strip club, Malibu and the stadium events) now keep it: the event/room track plays while you are in there — including seated in the car for the Hotring, Bloodring and Dirt Ring events — and is stopped properly when you leave, instead of continuing to play outside until you paused the game.
+- Story radio announcements now play in police vehicles too, like the original game: the bulletin interrupts the police scanner and the scanner resumes when it finishes. Previously getting into a police car meant the announcement was never heard.
+- The plugin now checks that the game executable is the one it targets (GTA VC 1.0 US) before patching anything. On a different build — some repacks ship one — it skips its patches and says so in NorthstarRadio.log instead of writing into unrelated code, which could crash the game.
+- Story radio announcements now survive a failed script hook: if the plugin cannot hook the game's script engine (which can happen silently on some custom executables, leaving the bridge-closed / bridge-open bulletins permanently missing), it falls back to reading the announcement straight from the game's own announcement call. NorthstarRadio.log now states whether the script hook installed, so a missing announcement is diagnosable instead of silent.
 
 Version 1.2
 - New 3D ambient radio: the radio heard from passing cars is now spatial. The sound pans between your speakers following the car's position relative to the camera, the muffling opens up as the car gets close (a distant radio is all bass; the actual music emerges as it approaches), cars behind the camera sound duller, and a doppler effect shifts the pitch as the car drives past — like real life. Toggle with AmbientRadio3D in [SETTINGS] (on by default; set 0 for the old flat volume-only fade). Requires AmbientRadio = 1.
