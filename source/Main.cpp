@@ -244,6 +244,20 @@ static bool gNoRadioVehicle = false;
 // SFX
 static HSTREAM gSfxTuningStream = 0;
 static HSTREAM gSfxStaticStream = 0;
+
+// The "mission passed" jingle (AUDIO\MISCOM.MP3, stream slots 9 / 99-102). The GAME
+// plays it — even while the suppression patches are in place (verified: with
+// native audio suppressed and the radio off, the game's own jingle still
+// sounded, so playing it from the plugin as well doubled it). The plugin only
+// ducks the radio under it. A user once reported not hearing it, which could not
+// be reproduced, so after each 0394 the music manager is WATCHED for a moment
+// and the log records whether the game actually started a MISCOM slot — if the miss
+// ever recurs, NorthstarRadio.log says what the music manager was doing.
+extern std::atomic<bool> gMissionPassedTune;  // set by the SCM hook on opcode 0394
+static DWORD gTuneWatchUntil = 0;             // 0 = not watching
+static int   gTuneWatchTrack = -1;            // last logged music track
+static int   gTuneWatchMode = -1;             // last logged music mode
+static bool  gTuneWatchSawMiscom = false;     // the game started a MISCOM slot
 static bool gSfxLoaded = false;
 
 // SDT entry structure — GTA VC PC: 20 bytes each
@@ -390,6 +404,7 @@ static void StopStaticSound()
     }
 }
 
+
 static void TurnRadioOff()
 {
     if (gStream) {
@@ -432,6 +447,8 @@ static void StopAndResetRadio()
         std::lock_guard<std::mutex> lock(gLoadMutex);
         gLoadedBuffer.clear();
     }
+    gMissionPassedTune = false;
+    gTuneWatchUntil = 0;
     gBufferReady = false;
     gWaitingToPlay = false;
     gWasInVehicle = false;
@@ -1086,6 +1103,46 @@ public:
                     gWasPaused = false;
                 }
                 if (isPaused) return;
+
+                // ===== "Mission passed" jingle (SCM opcode 0394): watch, don't play =====
+                // The game plays the jingle itself (MISCOM.MP3, slots 9 / 99-102) even
+                // with the suppression patches in place — playing it from the plugin
+                // too doubled it. So the plugin only ducks the radio, and for a few
+                // seconds after 0394 it logs the music manager's track/mode on every
+                // change, then whether a MISCOM slot started. A missed jingle (reported
+                // once, never reproduced) would then show up in the log with the music
+                // manager's state at the time, instead of being a guess. Placed before
+                // the early-returning vehicle branches so it runs in every situation.
+                if (gMissionPassedTune.exchange(false)) {
+                    gTuneWatchUntil = GetTickCount() + 3000;
+                    gTuneWatchTrack = -1;
+                    gTuneWatchMode = -1;
+                    gTuneWatchSawMiscom = false;
+                }
+                if (gTuneWatchUntil) {
+                    int track = *(int*)(0x980038 + 0x3988);           // cMusicManager playing track
+                    int mode = *(unsigned char*)(0x980038 + 0x398D);   // music mode (1 = game, 0 = frontend)
+                    // Stream slots 9 AND 99-102 all point at AUDIO\MISCOM.MP3 (the
+                    // game's mission-complete variants); a normal mission pass was seen
+                    // playing slot 101 in frontend mode (0). Checking slot 9 alone
+                    // reported a tune that played fine as missing.
+                    if (track == 9 || (track >= 99 && track <= 102))
+                        gTuneWatchSawMiscom = true;
+                    if (track != gTuneWatchTrack || mode != gTuneWatchMode) {
+                        gLog << "Mission passed watch: music track " << track
+                             << " mode " << mode << std::endl;
+                        gTuneWatchTrack = track;
+                        gTuneWatchMode = mode;
+                    }
+                    if (GetTickCount() > gTuneWatchUntil) {
+                        gLog << (gTuneWatchSawMiscom
+                                 ? "Mission passed watch: game played the tune (MISCOM)"
+                                 : "Mission passed watch: *** game did NOT start the tune (no MISCOM track seen) ***")
+                             << std::endl;
+                        gTuneWatchUntil = 0;
+                    }
+                    gLog.flush();
+                }
 
                 CVehicle* pVehicle = pPlayer->m_pVehicle;
                 bool inVehicle = pPlayer->m_bInVehicle;

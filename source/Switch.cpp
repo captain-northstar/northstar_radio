@@ -49,6 +49,13 @@ std::atomic<int> gPendingScmStationTime{ -1 };
 // "mission passed" tune (opcode 0394); gDialogueDuckUntil is refreshed by each
 // mission dialogue line (opcode 03D1 PLAY_MISSION_AUDIO).
 std::atomic<DWORD> gMissionPassedDuckUntil{ 0 };
+
+// Set when the script fires 0394 PLAY_MISSION_PASSED_TUNE. The jingle is stream
+// 9 (AUDIO\MISCOM.MP3) and the game plays it itself, even with the suppression
+// patches in place. Main.cpp uses this flag only to WATCH the music manager for a
+// few seconds and log whether a MISCOM slot actually started (diagnostics for a missed
+// jingle that was reported once and never reproduced).
+std::atomic<bool> gMissionPassedTune{ false };
 std::atomic<DWORD> gDialogueDuckUntil{ 0 };
 
 // CPad::NewMouseControllerState.wheelUp / .wheelDown  (current-frame mouse state).
@@ -228,6 +235,35 @@ static bool __fastcall Hook_ChangeStationJustDown(CPad* self, void* edx)
 static BYTE gOrigSetRadioInCar[5];
 static BYTE gOrigRadioProcess[5];
 static bool gNativeAudioAllowed = false; // false = patches applied (suppressed)
+static int  gNativeArea = 0;             // the area the native code was last let through in
+
+// ---- Interiors with their own music (2026-10-20) --------------------------------------------------------------------
+// User: in the hotring event the announcer played but not the event's music, which then played outside after the event.
+// 0x5FB600 is cMusicManager::ServiceGameMode. Its area table (0x6CDB44) keeps the CAR RADIO OFF in the hotel (1), the
+// mall (4), the strip club (5), the stadium events (14 dirt ring, 15 bloodring, 16 hotring) and Malibu (17) and plays the
+// room's own track instead (stream ids 16 MALLAMB, 17 STRIP, 18 MALIBU, 19 HOTEL, 20 DIRTRING). The stadium events seat
+// the player in a car, so "native only on foot in interiors" silenced their music. In these areas the native code is let
+// through in a vehicle too - it never runs the car radio there, so no stock station and no banner.
+static bool AreaHasOwnMusic(int area)
+{
+    return area == 1 || area == 4 || area == 5 || (area >= 14 && area <= 17);
+}
+
+// cMusicManager (0x980038): +0x3988 = the track playing, +0x398D = the music mode now (1 game, 4 disabled). A no-op
+// ServiceGameMode cannot stop a track it started, so re-patching while an interior's music played left it playing
+// outside (until a pause - the pause menu's music-mode change stops it). The same is done here: cDMAudio::ChangeMusicMode
+// (0x5F98B0) to "disabled" makes cMusicManager::Service (never patched) stop the stream and forget the track, then back
+// to game music. No vehicle is touched (the stadium exit is a teleport out of the event car - DMAudio.SetRadioInCar once
+// crashed there).
+static const uintptr_t kMusicPlayingTrack = 0x980038 + 0x3988;
+static const uintptr_t kMusicModeNow      = 0x980038 + 0x398D;
+static int   gMusicCycle = 0;     // 1 = waiting for the music manager to reach "disabled"
+static DWORD gMusicCycleTick = 0;
+
+static void ChangeMusicMode(unsigned char mode)
+{
+    plugin::CallMethod<0x5F98B0, cDMAudio*, unsigned char>(&DMAudio, mode);
+}
 
 // ---- Executable verification -------------------------------------------------
 //
@@ -382,6 +418,14 @@ static void OnProcessOneCommand(SafetyHookContext& ctx)
 
     if (op == 0x0394) {          // PLAY_MISSION_PASSED_TUNE -> duck the radio for the jingle
         gMissionPassedDuckUntil = GetTickCount() + 5000;
+        gMissionPassedTune = true;   // Main.cpp watches whether the game plays the tune
+        if (gLog.is_open()) {
+            gLog << "SCM 0394: mission passed (native audio "
+                 << (gNativeAudioAllowed ? "ALLOWED" : "suppressed")
+                 << "; music track " << *(int*)(0x980038 + 0x3988)
+                 << " mode " << (int)*(unsigned char*)(0x980038 + 0x398D) << ")" << std::endl;
+            gLog.flush();
+        }
         return;
     }
 
@@ -683,10 +727,23 @@ public:
                 // function cannot STOP a sound the game already started, so re-patching
                 // while interior music was playing froze it and it played forever.
                 // Fixed properly below by telling the game to stop it first.
-                bool allowNative = (CGame::currArea != 0) && !vehicleBusy;
+                bool allowNative = (CGame::currArea != 0) && (!vehicleBusy || AreaHasOwnMusic(CGame::currArea));
 
                 if (allowNative != gNativeAudioAllowed) {
-                    if (!allowNative) {
+                    int playing = *(int*)kMusicPlayingTrack;
+                    bool roomMusic = playing >= 16 && playing <= 20;
+                    if (!allowNative && (roomMusic || AreaHasOwnMusic(gNativeArea))) {
+                        // Leaving a room with its own music: stop it with a music-mode change (see ChangeMusicMode) -
+                        // and not with SetRadioInCar, which the car radio never needed in these rooms.
+                        if (roomMusic) {
+                            ChangeMusicMode(3);
+                            gMusicCycle = 1;
+                            gMusicCycleTick = GetTickCount();
+                            if (gLog.is_open())
+                                gLog << "RadioHooks: room music (track " << playing << ") stopped on leaving area " << gNativeArea << std::endl;
+                        }
+                    }
+                    else if (!allowNative) {
                         // About to re-apply the patches. VC plays interior/club/stadium
                         // music THROUGH the radio system (that is why these patches
                         // silence it), so ask the game to switch that radio off while
@@ -698,19 +755,36 @@ public:
                         //
                         // Safe to call here, unlike the per-frame call this replaces:
                         // that one also ran during the event-end teleport/teardown,
-                        // which is what crashed inside gta-vc.exe. By the time an event
-                        // ends the player is already in the event vehicle, so the
-                        // patches are applied and this transition has long since passed.
+                        // which is what crashed inside gta-vc.exe. (Rooms with their own
+                        // music - the stadium events included, which are now let through
+                        // in the event car - take the branch above instead, so this never
+                        // runs on the event-end teleport.)
                         const unsigned int RADIO_OFF = 10;
                         DMAudio.SetRadioInCar(RADIO_OFF);
                     }
                     ApplyRadioSuppression(!allowNative);
+                    if (allowNative) gNativeArea = CGame::currArea;
                     if (gLog.is_open()) {
                         gLog << "RadioHooks: native audio "
                              << (allowNative ? "ALLOWED" : "suppressed (native radio switched off first)")
                              << " (area " << CGame::currArea
                              << ", vehicle " << (vehicleBusy ? 1 : 0) << ")" << std::endl;
                         gLog.flush();
+                    }
+                }
+
+                if (allowNative && CGame::currArea != gNativeArea) gNativeArea = CGame::currArea;
+
+                // The music-mode change above: once the stream is stopped, back to game music (the pause menu makes
+                // its own mode change - nothing left to do then).
+                if (gMusicCycle) {
+                    unsigned char modeNow = *(unsigned char*)kMusicModeNow;
+                    if (gRadioInputBlocked && modeNow != 4) gMusicCycle = 0;
+                    else if (modeNow == 4 || GetTickCount() - gMusicCycleTick > 3000) {
+                        ChangeMusicMode(1);
+                        gMusicCycle = 0;
+                        if (gLog.is_open())
+                            gLog << "RadioHooks: game music mode back" << (modeNow == 4 ? "" : " (timeout)") << std::endl;
                     }
                 }
 
